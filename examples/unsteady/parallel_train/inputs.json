@@ -1,0 +1,65 @@
+{
+  "pathfile": "./../../../PATHS.txt",
+
+  "elements": ["interior", "port"],
+
+  "paths": {
+    "inpfile": {
+      "interior": "./../inputs/train_rom.json",
+      "port": "./../inputs/train_rom_port.json"
+    },
+    "inp_dir": "./../inputs_parallel_train/",
+    "cmd_dir": "./../commands_parallel_train/",
+    "save_dir": "/p/lustre5/cheung26/DD_NM_ROM_cole/examples/unsteady/dset.2by2/nets/run.01/"
+  },
+
+  "dim": {
+
+    "ranges": {
+      "interior": {
+        "latent_dim": {
+          "start": 9,
+          "stop": 37,
+          "step": 3
+        },
+        "row_nonzero": {
+          "start": 6,
+          "stop": 11,
+          "step": 2
+        }
+      },
+      "port": {
+        "latent_dim": {
+          "start": 4,
+          "stop": 15,
+          "step": 2
+        },
+        "row_nonzero": {
+          "start": 4,
+          "stop": 9,
+          "step": 2
+        }
+      }
+    },
+
+    "default": {
+      "interior": {
+        "latent_dim": 8,
+        "row_shift": 5,
+        "row_nonzero": 10
+      },
+      "port": {
+        "latent_dim": 4,
+        "row_shift": 3,
+        "row_nonzero": 6
+      }
+    }
+
+  },
+
+  "refine": {
+    "active": false,
+    "lr": 1e-4
+  }
+
+}

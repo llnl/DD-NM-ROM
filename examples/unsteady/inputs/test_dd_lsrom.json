@@ -1,0 +1,61 @@
+{
+  "pathfile": "./../../../PATHS.txt",
+  "env": {
+    "backend": "numpy",
+    "device": "cpu",
+    "device_idx": 0,
+    "nb_threads": 4,
+    "epsilon": 1e-10,
+    "floatx": "float64",
+    "seed": null
+  },
+  "mesh": {
+    "name": "MeshDD",
+    "kwargs": {
+      "nx_intr": 48,
+      "ny_intr": 48,
+      "lx_sub": 0.5,
+      "ly_sub": 0.5,
+      "x0": 0.0,
+      "y0": 0.0,
+      "n_sub_x": 2,
+      "n_sub_y": 2,
+      "with_bounds": true
+    }
+  },
+  "field": {
+    "name": "SinMultiPeak",
+    "kwargs": {
+      "mu_lim": [0.5, 1.5],
+      "forced_config": [1,0,0,0],
+      "bc_type": "periodic"
+    }
+  },
+  "fom": {
+    "name": "Burgers2D",
+    "kwargs": {
+      "nu": 1e-3
+    }
+  },
+  "dd_fom": {
+    "name": "DDBurgers2D",
+    "kwargs": {
+      "constraint_type": "strong",
+      "scaling": -1
+    }
+  },
+  "data_load": {
+    "n_workers": 25,
+    "ranges": [0,10],
+    "path": "/home/pinghsuan/Research/DD-NM-ROM_old/run/unsteady/dset.2by2/datagen/test/"
+  },
+  "paths": {
+    "pod_dir": "/home/pinghsuan/Research/DD-NM-ROM_old/run/unsteady/dset.2by2/pod/run.01/snapshots/",
+    "nets_dir": "/home/pinghsuan/Research/DD-NM-ROM_old/run/unsteady/dset.2by2/nets/run.01/",
+    "nets_tag": {
+      "interior": "",
+      "port": ""
+    },
+    "figs_dir": "/usr/workspace/zanardi1/Codes/DD-NM-ROM/run/unsteady/dset.2by2/figures/"
+  }
+}

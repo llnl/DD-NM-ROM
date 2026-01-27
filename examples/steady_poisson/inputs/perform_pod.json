@@ -1,0 +1,64 @@
+{
+  "pathfile": "./../../../PATHS.txt",
+  "env": {
+    "backend": "numpy",
+    "device": "cpu",
+    "device_idx": 0,
+    "nb_threads": 8,
+    "epsilon": 1e-10,
+    "floatx": "float64",
+    "seed": 0
+  },
+  "mesh": {
+    "name": "MeshDD",
+    "kwargs": {
+      "nx_intr": 48,
+      "ny_intr": 48,
+      "lx_sub": 0.5,
+      "ly_sub": 0.5,
+      "x0": 0.0,
+      "y0": 0.0,
+      "n_sub_x": 2,
+      "n_sub_y": 2,
+      "with_bounds": true
+    }
+  },
+  "field": {
+    "name": "PoissonForce",
+    "kwargs": {
+      "mu_lim": [4.5, 13.5],
+      "forced_config": [0,0,0,0],
+      "bc_type": "periodic"
+    }
+  },
+  "fom": {
+    "name": "Poisson2D",
+    "kwargs": {
+      "nu": 1
+    }
+  },
+  "svd": {
+    "nb_samples": -1,
+    "energy_min": {
+      "res": 1e-10,
+      "interior": 1e-6,
+      "interface": 1e-6,
+      "port": 1e-6
+    },
+    "n_bases": {
+      "res": -1,
+      "interior": -1,
+      "interface": -1,
+      "port": -1
+    },
+    "get_bases": true,
+    "verbose": true
+  },
+  "data_load": {
+    "n_workers": 20,
+    "ranges": [0,100],
+    "key": "snapshots",
+    "path": "/home/pinghsuan/Research/DD-NM-ROM/run/Poisson/dset.2by2/datagen/train/"
+  },
+  "save_dir": "/home/pinghsuan/Research/DD-NM-ROM/run/Poisson/dset.2by2/pod/run.01/"
+}

@@ -1,0 +1,45 @@
+{
+  "system": "tuo",
+
+  "pathfile": "./../../../PATHS.txt",
+
+  "elements": ["interior", "port"],
+
+  "paths": {
+    "inpfile": "./../inputs/test_dd_nmrom.json",
+    "inp_dir": "./../inputs_parallel_test/",
+    "cmd_dir": "./../commands_parallel_test/"
+  },
+
+  "dim": {
+
+    "ranges": {
+      "interior": {
+        "latent_dim": {
+          "start": 12,
+          "stop": 37,
+          "step": 6
+        },
+        "row_nonzero": {
+          "start": 10,
+          "stop": 11,
+          "step": 2
+        }
+      },
+      "port": {
+        "latent_dim": {
+          "start": 6,
+          "stop": 15,
+          "step": 2
+        },
+        "row_nonzero": {
+          "start": 8,
+          "stop": 9,
+          "step": 2
+        }
+      }
+    }
+  
+  }
+
+}

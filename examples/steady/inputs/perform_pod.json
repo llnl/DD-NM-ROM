@@ -1,0 +1,63 @@
+{
+  "pathfile": "./../../../PATHS.txt",
+  "env": {
+    "backend": "numpy",
+    "device": "cpu",
+    "device_idx": 0,
+    "nb_threads": 8,
+    "epsilon": 1e-10,
+    "floatx": "float64",
+    "seed": 0
+  },
+  "mesh": {
+    "name": "MeshDD",
+    "kwargs": {
+      "nx_intr": 239,
+      "ny_intr": 11,
+      "lx_sub": 1.0,
+      "ly_sub": 0.025,
+      "x0": -1.0,
+      "y0": 0.0,
+      "n_sub_x": 2,
+      "n_sub_y": 2
+    }
+  },
+  "field": {
+    "name": "Burgers2DExact",
+    "kwargs": {
+      "nu": 1e-1,
+      "a_lim": [1.0, 1e4],
+      "k_lim": [5.0, 25.0]
+    }
+  },
+  "fom": {
+    "name": "Burgers2D",
+    "kwargs": {
+      "nu": 1e-1
+    }
+  },
+  "svd": {
+    "nb_samples": -1,
+    "energy_min": {
+      "res": 1e-10,
+      "interior": 1e-6,
+      "interface": 1e-6,
+      "port": 1e-6
+    },
+    "n_bases": {
+      "res": -1,
+      "interior": -1,
+      "interface": -1,
+      "port": -1
+    },
+    "get_bases": true,
+    "verbose": true
+  },
+  "data_load": {
+    "n_workers": 20,
+    "ranges": [0,400],
+    "key": "residuals",
+    "path": "/g/g92/zanardi1/Workspace/Codes/DD-NM-ROM/run/steady/dset.02/datagen/"
+  },
+  "save_dir": "/g/g92/zanardi1/Workspace/Codes/DD-NM-ROM/run/steady/dset.02/pod/run.01"
+}

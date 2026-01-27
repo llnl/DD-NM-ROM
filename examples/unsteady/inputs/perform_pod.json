@@ -1,0 +1,64 @@
+{
+  "pathfile": "./../../../PATHS.txt",
+  "env": {
+    "backend": "numpy",
+    "device": "cpu",
+    "device_idx": 0,
+    "nb_threads": 16,
+    "epsilon": 1e-10,
+    "floatx": "float64",
+    "seed": 0
+  },
+  "mesh": {
+    "name": "MeshDD",
+    "kwargs": {
+      "nx_intr": 48,
+      "ny_intr": 48,
+      "lx_sub": 0.5,
+      "ly_sub": 0.5,
+      "x0": 0.0,
+      "y0": 0.0,
+      "n_sub_x": 2,
+      "n_sub_y": 2,
+      "with_bounds": true
+    }
+  },
+  "field": {
+    "name": "SinMultiPeak",
+    "kwargs": {
+      "mu_lim": [0.5, 1.5],
+      "forced_config": [1,0,0,0],
+      "bc_type": "periodic"
+    }
+  },
+  "fom": {
+    "name": "Burgers2D",
+    "kwargs": {
+      "nu": 1e-3
+    }
+  },
+  "svd": {
+    "nb_samples": -1,
+    "energy_min": {
+      "res": 1e-3,
+      "interior": 1e-3,
+      "interface": 1e-3,
+      "port": 1e-3
+    },
+    "n_bases": {
+      "res": -1,
+      "interior": -1,
+      "interface": -1,
+      "port": -1
+    },
+    "get_bases": true,
+    "verbose": true
+  },
+  "data_load": {
+    "n_workers": 50,
+    "ranges": [0,2000],
+    "key": "snapshots",
+    "path": "/usr/workspace/nlrom/DD-NM-ROM/dataset/unsteady_5e-3_general/dset.2by2/datagen/train/"
+  },
+  "save_dir": "/p/lustre5/cheung26/DD_NM_ROM_cole/examples/unsteady/dset.2by2/pod/"
+}

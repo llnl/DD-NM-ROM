@@ -1,0 +1,60 @@
+{
+  "pathfile": "./../../../PATHS.txt",
+  "env": {
+    "backend": "numpy",
+    "device": "cpu",
+    "device_idx": 0,
+    "nb_threads": 8,
+    "epsilon": 1e-10,
+    "floatx": "float64",
+    "seed": null
+  },
+  "mesh": {
+    "name": "MeshDD",
+    "kwargs": {
+      "nx_intr": 48,
+      "ny_intr": 48,
+      "lx_sub": 0.5,
+      "ly_sub": 0.5,
+      "x0": 0.0,
+      "y0": 0.0,
+      "n_sub_x": 10,
+      "n_sub_y": 10,
+      "with_bounds": false
+    }
+  },
+  "field": {
+    "name": "SinMultiPeak",
+    "kwargs": {
+      "mu_lim": [0.5, 1.5],
+      "bc_type": "neumann"
+    }
+  },
+  "fom": {
+    "name": "Burgers2D",
+    "kwargs": {
+      "nu": 1e-3
+    }
+  },
+  "dd_fom": {
+    "name": "DDBurgers2D",
+    "kwargs": {
+      "constraint_type": "strong",
+      "scaling": -1
+    }
+  },
+  "data_load": {
+    "n_workers": 1,
+    "ranges": [0,2],
+    "path": "/g/g92/zanardi1/Workspace/Codes/DD-NM-ROM/run/unsteady/dset.10by10/datagen/test/"
+  },
+  "paths": {
+    "pod_dir": "/g/g92/zanardi1/Workspace/Codes/DD-NM-ROM/run/unsteady/dset.2by2/pod/run.01/snapshots/",
+    "nets_dir": "/g/g92/zanardi1/Workspace/Codes/DD-NM-ROM/run/unsteady/dset.2by2/nets/run.01/",
+    "nets_tag": {
+      "interior": "interior_ld_24_rnz_10",
+      "port": "port_ld_10_rnz_8"
+    },
+    "figs_dir": "/g/g92/zanardi1/Workspace/Codes/DD-NM-ROM/run/unsteady/dset.10by10/figures/"
+  }
+}

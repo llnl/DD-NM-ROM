@@ -1,0 +1,46 @@
+{
+  "pathfile": "./../../../PATHS.txt",
+  "env": {
+    "backend": "numpy",
+    "device": "cpu",
+    "device_idx": 0,
+    "nb_threads": 4,
+    "epsilon": 1e-10,
+    "floatx": "float64",
+    "seed": 0
+  },
+  "mesh": {
+    "name": "MeshMono",
+    "kwargs": {
+      "nx": 480,
+      "ny": 24,
+      "x_lim": [-1.0, 1.0],
+      "y_lim": [0.0, 0.05]
+    }
+  },
+  "field": {
+    "name": "Burgers2DExact",
+    "kwargs": {
+      "nu": 1e-1,
+      "a_lim": [1.0, 1e4],
+      "k_lim": [5.0, 25.0]
+    }
+  },
+  "fom": {
+    "name": "Burgers2D",
+    "kwargs": {
+      "nu": 1e-1
+    }
+  },
+  "solver": {
+    "tol": 1e-8,
+    "maxit": 50,
+    "stepsize_min": 1e-10,
+    "verbose": false
+  },
+  "data_gen": {
+    "n_samples": 6400,
+    "n_workers": 32
+  },
+  "save_dir": "/g/g92/zanardi1/Workspace/Codes/DD-NM-ROM/run/steady/dset.01/datagen/"
+}

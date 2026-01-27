@@ -1,0 +1,30 @@
+absl-py
+dask
+dill
+joblib
+matplotlib
+numpy-indexed
+pandas
+pydoe
+scikit-learn
+simpy
+sparselinear
+threadpoolctl
+tqdm
+torch==2.8.0a0+gitba56102.rocm631
+torchinfo
+# NOTE: these are installed in the create_env.sh script due to extra options needed
+#-e git+https://github.com/rusty1s/pytorch_sparse.git@master#egg=torch-sparse
+#-e git+https://github.com/rusty1s/pytorch_scatter.git@master#egg=torch-scatter
+h5py
+ipykernel
+jupyterlab
+markdown
+markupsafe
+notebook
+numpy
+pydot
+pygments
+scipy
+silx
+wheel

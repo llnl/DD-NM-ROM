@@ -15,7 +15,8 @@ class Model(object):
     self,
     net=None,
     data=None,
-    path="./"
+    path="./",
+    chk_meta=None,
   ):
     self.net = net
     self.data = data
@@ -41,6 +42,10 @@ class Model(object):
     # Control vars
     self.is_compiled = False
     self.stop_training = False
+
+    self.meta = dict()
+    if chk_meta is not None:
+      self.meta = dict(chk_meta)
 
     self.rank = 0
     if bkd.distributed():
@@ -70,7 +75,6 @@ class Model(object):
   ):
     print("Compiling the model ...")
     # Write nn summary
-    # summary(filename=self.dirs["save"] + "/summary.txt")
     summary_fname = self.dirs["save"] + "/summary.txt"
     if bkd.distributed():
       summary_fname = summary_fname + ".{:d}".format(bkd.get_rank())
@@ -114,7 +118,6 @@ class Model(object):
       if bkd.distributed():
         with self.ddp_net.join(throw_on_early_termination=True):
           self.train_sgd()
-        #torch.cuda.synchronize(device=bkd.get_rank())
         torch.cuda.synchronize()
         bkd._COMM.Barrier()
       else:
@@ -205,7 +208,8 @@ class Model(object):
             'optimizer_state_dict': self.optimizer.state_dict(),
             'epoch': self.train_state.epoch,
             'random_state_np': np.random.get_state(),
-            'random_state': torch.cuda.get_rng_state(device=bkd.device())
+            'random_state': torch.cuda.get_rng_state(device=bkd.device()),
+            'metadata': self.meta
         }
 
         if self.lr_scheduler is not None:

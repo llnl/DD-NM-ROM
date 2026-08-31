@@ -45,9 +45,12 @@ from dd_nm_rom import backend as bkd
 # Initialization
 # =====================================
 print("\nInitialization ...")
+
 # Mesh
 mesh = utils.get_class(modules=[mesh_mod], **inputs["mesh"])
 mesh.build()
+
+fom_subs_per_rank = (mesh.n_sub) // bkd.get_nranks()
 # Field
 field = utils.get_class(
   modules=[field_mod],
@@ -62,7 +65,7 @@ fom = utils.get_class(
 dd_fom = utils.get_class(
   modules=[fom_mod],
   name="DDBurgers2D"
-)(monolithic=fom, **inputs["dd_fom"]["kwargs"])
+)(monolithic=fom, subs_per_rank=fom_subs_per_rank, **inputs["dd_fom"]["kwargs"])
 # Construct design matrices
 n_samples = inputs["data_gen"]["n_samples"]
 mu = {"train": [], "test": []}

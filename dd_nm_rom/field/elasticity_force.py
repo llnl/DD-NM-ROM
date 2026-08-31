@@ -27,7 +27,8 @@ class ElasticityForce(BasicField):
         mu_lim_x: List[float] = [0.9, 1.1],
         mu_lim_y: List[float] = [0.9, 1.1],
         forced_config: Union[List[int], np.ndarray, None] = None,
-        bc_type: str = "periodic"
+        bc_type: str = "periodic",
+        use_qmc: bool = True
     ) -> None:
         super(ElasticityForce, self).__init__(mesh)
         bc_mod.check_bc_type(bc_type)
@@ -37,6 +38,7 @@ class ElasticityForce(BasicField):
         self.mu_lim_y = mu_lim_y
         self.configs = None
         self.forced_config = forced_config
+        self.use_qmc = use_qmc
         if (self.forced_config is not None):
             self.forced_config = np.array(self.forced_config).reshape(-1)
 
@@ -47,25 +49,25 @@ class ElasticityForce(BasicField):
         Initializes the design space for force parameters.
         The design space is now larger: [Config, Magnitudes_x, Magnitudes_y, Freq_x, Freq_y]
         """
-        # Define possible combinations, exclude an array of all zeros
-        # Cretae 15 x 4 array for 4 subdomains for example
-        self.configs = ops.generate_combs([np.arange(2)]*self.mesh.n_sub)[1:]
-        if (self.forced_config is not None):
-            self.configs += self.forced_config.reshape(1,-1)
-            self.configs = self.configs.astype(bool).astype(int)
-            self.configs = np.unique(self.configs, axis=0)
-        
-        # Define design space:
-        # [0] Config index
-        # [1:1+n_sub] Force Magnitudes for x-displacement (fx)
-        # [1+n_sub:1+2*n_sub] Force Magnitudes for y-displacement (fy)
-        # [-2:] Frequencies (freq_x, freq_y)
-        self.design_space = (
-            [[0,len(self.configs)]] + 
-            [self.mu_lim_x]*self.mesh.n_sub + 
-            [self.mu_lim_y]*self.mesh.n_sub + 
-            [[2, 6]]*2
-        )
+        if self.use_qmc:
+            self.design_space = (
+                [self.mu_lim_x]*self.mesh.n_sub +
+                [self.mu_lim_y]*self.mesh.n_sub +
+                [[2, 6]]*2
+            )
+        else:
+            # Define possible combinations (legacy path).
+            self.configs = ops.generate_combs([np.arange(2)]*self.mesh.n_sub)[1:]
+            if (self.forced_config is not None):
+                self.configs += self.forced_config.reshape(1,-1)
+                self.configs = self.configs.astype(bool).astype(int)
+                self.configs = np.unique(self.configs, axis=0)
+            self.design_space = (
+                [[0,len(self.configs)]] +
+                [self.mu_lim_x]*self.mesh.n_sub +
+                [self.mu_lim_y]*self.mesh.n_sub +
+                [[2, 6]]*2
+            )
         self.design_space = np.array(self.design_space).T
 
     def sample_design_space(self) -> np.ndarray:
@@ -92,9 +94,18 @@ class ElasticityForce(BasicField):
         n_samples: int
     ) -> np.ndarray:
         """Generates a Latin Hypercube sample matrix and enforces constraints."""
-        # Generate Latin Hypercube samples
+        if self.use_qmc:
+            dmat, mask = super(ElasticityForce, self).construct_design_mat_qmc(n_samples)
+            n = self.mesh.n_sub
+            if n >= 4:
+                dmat[:, n - 1] = dmat[:, 1] + dmat[:, 2] - dmat[:, 0]
+                min_val_x, max_val_x = self.mu_lim_x
+                dmat[:, n - 1] = np.clip(dmat[:, n - 1], min_val_x, max_val_x)
+            return self._convert_dmat_to_mu(dmat, mask)
+
+        # Legacy LHS path.
         dmat = super(ElasticityForce, self).construct_design_mat(n_samples)
-        
+
         # Check if the matrix size matches the expected size for 4 subdomains (1 + 4 + 4 + 2 = 11 columns)
         if dmat.shape[1] == 11:
             # Enforce the zero-mean constraint (here applied to fx, column 4)
@@ -110,9 +121,23 @@ class ElasticityForce(BasicField):
 
     def _convert_dmat_to_mu(
         self,
-        dmat: np.ndarray
+        dmat: np.ndarray,
+        mask: Union[np.ndarray, None] = None
     ) -> np.ndarray:
         """Converts the sampled design matrix back to the parameter vector (mu)."""
+        if self.use_qmc:
+            n = self.mesh.n_sub
+            amplitudes = dmat[:, :2*n]
+            if (self.forced_config is not None):
+                forced = np.tile(self.forced_config.reshape(1, -1), (1, 2))
+                mask = np.maximum(mask[:, :2*n], forced)
+            else:
+                mask = mask[:, :2*n]
+            amplitudes = mask * amplitudes
+            frequencies = dmat[:, -2:].copy()
+            frequencies = (2 * np.round(frequencies / 2)).astype(np.int32)
+            return np.hstack([amplitudes, frequencies])
+
         cfg = np.floor(dmat[:,0]).astype(np.int32)
         # Ensure the last two columns (frequencies) are integer and even
         dmat[:, -2:] = (2 * np.round(dmat[:, -2:] / 2)).astype(np.int32)

@@ -17,7 +17,8 @@ class MultiPeak(BasicField):
     mesh: mesh_mod.MeshDD,
     mu_lim: List[float] = [0.9, 1.1],
     forced_config: Union[List[int], np.ndarray, None] = None,
-    bc_type: str = "neumann"
+    bc_type: str = "neumann",
+    use_qmc: bool = True
   ) -> None:
     super(MultiPeak, self).__init__(mesh)
     bc_mod.check_bc_type(bc_type)
@@ -25,6 +26,7 @@ class MultiPeak(BasicField):
     self.mu_lim = mu_lim
     self.configs = None
     self.forced_config = forced_config
+    self.use_qmc = use_qmc
     if (self.forced_config is not None):
       self.forced_config = np.array(self.forced_config).reshape(-1)
 
@@ -42,14 +44,18 @@ class MultiPeak(BasicField):
         design_space[0, :] -> lower bounds
         design_space[1, :] -> upper bounds
     """
-    # Define possible combinations
-    self.configs = ops.generate_combs([np.arange(2)]*self.mesh.n_sub)[1:]
-    if (self.forced_config is not None):
-      self.configs += self.forced_config.reshape(1,-1)
-      self.configs = self.configs.astype(bool).astype(int)
-      self.configs = np.unique(self.configs, axis=0)
-    # Define design space
-    self.design_space = [[0,len(self.configs)]] + [self.mu_lim]* (2*self.mesh.n_sub)
+    if self.use_qmc:
+      # QMC samples each amplitude directly.  The activation mask is derived
+      # from the unit-cube sample, so no configuration table is needed.
+      self.design_space = [self.mu_lim] * (2*self.mesh.n_sub)
+    else:
+      # Define possible combinations (legacy path).
+      self.configs = ops.generate_combs([np.arange(2)]*self.mesh.n_sub)[1:]
+      if (self.forced_config is not None):
+        self.configs += self.forced_config.reshape(1,-1)
+        self.configs = self.configs.astype(bool).astype(int)
+        self.configs = np.unique(self.configs, axis=0)
+      self.design_space = [[0,len(self.configs)]] + [self.mu_lim]* (2*self.mesh.n_sub)
     self.design_space = np.array(self.design_space).T
 
   def sample_design_space(self) -> np.ndarray:
@@ -90,13 +96,23 @@ class MultiPeak(BasicField):
         np.ndarray: A (n_samples × n_sub) array of masked amplitude vectors, where
         each row represents a sample with μ_i values only in the active subdomains.
     """
+    if self.use_qmc:
+      dmat, mask = super(MultiPeak, self).construct_design_mat_qmc(n_samples)
+      return self._convert_dmat_to_mu(dmat, mask)
     dmat = super(MultiPeak, self).construct_design_mat(n_samples)
     return self._convert_dmat_to_mu(dmat)
 
   def _convert_dmat_to_mu(
     self,
-    dmat: np.ndarray
+    dmat: np.ndarray,
+    mask: Union[np.ndarray, None] = None
   ) -> np.ndarray:
+    if self.use_qmc:
+      if (self.forced_config is not None):
+        forced = self.forced_config.reshape(1, -1)
+        mask = np.maximum(mask, np.tile(forced, (mask.shape[0], 2)))
+      return mask * dmat
+
     cfg = np.floor(dmat[:,0]).astype(np.int32)
 
     mu_u_raw = dmat[:, 1 : 1 + self.mesh.n_sub]

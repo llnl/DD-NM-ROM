@@ -1,6 +1,8 @@
 import abc
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch_sla as sla
 
 from time import time
 from typing import Tuple, Union
@@ -8,6 +10,9 @@ from typing_extensions import Unpack
 
 from . import dtypes
 from .. import backend as bkd
+
+from dd_nm_rom.utils import parallel_print
+import dd_nm_rom.config as cfg
 
 
 class Solver(object):
@@ -30,6 +35,16 @@ class Solver(object):
   :type stepsize_min: float
   :param verbose: Whether to print iteration details. Defaults to False.
   :type verbose: bool
+  :param distributed: Whether the solver is used in a distributed execution.
+                      Defaults to False.
+  :type distributed: bool
+  :param use_line_search: Whether to use Armijo backtracking. If false, each
+                          solver accepts the full step. Defaults to True.
+  :type use_line_search: bool
+  :param preconditioner: Preconditioner for iterative sparse linear solves.
+                         ``None`` (or ``"none"``) disables preconditioning.
+                         Defaults to ``None``.
+  :type preconditioner: str or None
   """
 
   def __init__(
@@ -39,7 +54,10 @@ class Solver(object):
     maxit: int = 20,
     stepsize_min: float = 1e-10,
     iostep: int = 1,
-    verbose: bool = False
+    verbose: bool = False,
+    distributed: bool = False,
+    use_line_search: bool = True,
+    preconditioner: str | None = None,
   ) -> None:
     self.model = model
     self.tol = tol
@@ -48,6 +66,20 @@ class Solver(object):
     self.iostep = iostep
     self.verbose = verbose
     self.squared_res = False
+    self.distributed_solve = distributed
+    self.use_line_search = cfg.update_from_env(
+      "DDNMROM_SOLVE_LINE_SEARCH",
+      use_line_search,
+    )
+    # Preserve an explicit ``None`` request while allowing the environment
+    # variable to use the user-facing ``none`` spelling.
+    preconditioner_option = "none" if preconditioner is None else preconditioner
+    self.preconditioner = cfg.update_from_env(
+      "DDNMROM_SOLVE_PRECONDITIONER",
+      preconditioner_option,
+    )
+    if isinstance(self.preconditioner, str) and self.preconditioner.lower() == "none":
+      self.preconditioner = None
     self.set_header()
 
   def set_header(self) -> None:
@@ -132,7 +164,12 @@ class Solver(object):
       self.model.t += dt
       xi, *step = self.solve(self.model.x_old)
       # Check convergence
-      res_norm, it, flag = step[1][-1], int(step[-2]), int(step[-1])
+      # Solver implementations return iteration/flag values as scalars,
+      # one-element arrays, or lists depending on the active backend.
+      # Normalize those representations before converting to Python ints.
+      it = int(np.asarray(step[-2]).reshape(-1)[-1].item())
+      flag = int(np.asarray(step[-1]).reshape(-1)[-1].item())
+      res_norm = step[1][-1]
       self.print_conv(res_norm, it, flag)
       start = time()
       # Update
@@ -182,11 +219,25 @@ class Solver(object):
   # ===================================
   # Solving
   # -----------------------------------
+  def full_step(
+    self,
+    x0: np.ndarray,
+    dx: np.ndarray,
+    use_global: bool = True,
+  ) -> Tuple[np.ndarray, Unpack[dtypes.EVAL_TYPE], float]:
+    """Take and evaluate one undamped solver step."""
+    start = time()
+    x = x0 + dx
+    self.model.runtime["total"] += time()-start
+    res, jac, res_norm = self.evaluate(x, use_global)
+    return x, res, jac, res_norm, 1.0
+
   def line_search(
     self,
     x0: np.ndarray,
     dx: np.ndarray,
-    eval_res_tol: callable
+    eval_res_tol: callable,
+    use_global: bool = True
   ) -> Tuple[np.ndarray, Unpack[dtypes.EVAL_TYPE], float]:
     """
     Perform Armijo line search to find a suitable step size.
@@ -208,11 +259,13 @@ class Solver(object):
     """
     # Initialize
     # -------------
+    use_global = True
     start = time()
     stepsize = 1.0
     x = x0 + stepsize*dx
     self.model.runtime["total"] += time()-start
-    res, jac, res_norm = self.evaluate(x)
+    res, jac, res_norm = self.evaluate(x, use_global)
+
     # Condition
     # -------------
     start = time()
@@ -228,17 +281,36 @@ class Solver(object):
       stepsize *= 0.5
       x = x0 + stepsize*dx
       self.model.runtime["total"] += time()-start
-      res, jac, res_norm = self.evaluate(x)
+      res, jac, res_norm = self.evaluate(x, use_global)
       # Condition
       # -------------
       start = time()
       cond = cond_fun(res_norm, stepsize)
       self.model.runtime["total"] += time()-start
+
+
+    if bkd.distributed() and not use_global:
+      global_res = bkd.gatherv_tensor(res, as_list=True)
+
+      cres = jac[0]
+      dist.reduce(cres, dst=0, op=dist.ReduceOp.SUM)
+
+      global_cjac = [bkd.gatherv_tensor(r, dim=1, as_list=True, coalesce=True) for r in jac[1]]
+      global_hess = [bkd.gatherv_tensor(r, as_list=True) for r in jac[2]]
+      global_jac = None
+      if bkd.root():
+        global_cjac = self.model.flatten_across_domain(global_cjac)
+        global_hess = self.model.flatten_across_domain(global_hess)
+        global_res, global_jac = self.model.assemble_kkt(global_res, cres, global_cjac, global_hess)
+      res = bkd.broadcast_tensor(global_res, root=0)
+      jac = bkd.broadcast_tensor(global_jac, root=0)
+      jac = jac.to_sparse_csr()
     return x, res, jac, res_norm, stepsize
 
   def evaluate(
     self,
-    x: np.ndarray
+    x: np.ndarray,
+    use_global: bool = True
   ) -> dtypes.EVAL_TYPE:
     """
     Evaluate the residual, Jacobian, and residual norm.
@@ -252,10 +324,15 @@ class Solver(object):
       - res_norm (float): Residual norm.
     :rtype: EVAL_TYPE
     """
-    res, jac = self.model.res_jac(x)
+    if bkd.distributed():
+      res, jac = self.model.res_jac(x)#, use_global=use_global)
+    else:
+      res, jac = self.model.res_jac(x)
     start = time()
     res = bkd.to_backend(res)
     res_norm = torch.dot(res, res) if bkd.is_torch_backend() else np.dot(res,res)
+    if bkd.distributed() and not use_global:
+      dist.all_reduce(res_norm, op=dist.ReduceOp.SUM)
     if (not self.squared_res):
       res_norm = res_norm.sqrt_() if bkd.is_torch_backend() else np.sqrt(res_norm)
     self.model.runtime["total"] += time()-start

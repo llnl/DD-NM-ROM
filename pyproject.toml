@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dd-nm-rom"
+version = "0.1.0"
+description = "Domain decomposition nonlinear-manifold reduced-order models"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Lawrence Livermore National Laboratory" },
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = [
+  "dask",
+  "dill",
+  "joblib",
+  "matplotlib",
+  "mpi4py",
+  "numpy",
+  "numpy-indexed",
+  "pandas",
+  "pyDOE",
+  "scipy",
+  "torch",
+  "torch-sla",
+  "torchinfo",
+  "tqdm",
+  "typing-extensions",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest",
+  "pytest-mpi",
+]
+
+[project.urls]
+Homepage = "https://github.com/LLNL/DD-NM-ROM"
+Repository = "https://github.com/LLNL/DD-NM-ROM"
+
+[tool.setuptools.packages.find]
+include = ["dd_nm_rom*"]
+namespaces = false

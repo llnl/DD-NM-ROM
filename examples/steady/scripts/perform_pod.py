@@ -6,6 +6,7 @@ import os
 import sys
 import json
 import argparse
+import torch
 
 # Inputs
 # =====================================
@@ -39,6 +40,7 @@ from dd_nm_rom import fom as fom_mod
 from dd_nm_rom import field as field_mod
 from dd_nm_rom.rom.utils import pod as pod_mod
 from dd_nm_rom.elements import mesh as mesh_mod
+from dd_nm_rom import backend as bkd
 
 # Initialization
 # =====================================
@@ -71,8 +73,19 @@ os.makedirs(path_to_save, exist_ok=True)
 # Data Loading
 # =====================================
 print("\nLoading data ...")
-dataset = utils.load_case_parallel(**inputs["data_load"])
-dataset = np.vstack([x for x in dataset if x is not None])
+#dataset = utils.load_case_parallel(**inputs["data_load"])
+#dataset = np.vstack([x for x in dataset if x is not None])
+if bkd.distributed():
+  for rank in range(bkd.get_nranks()):
+    if rank == bkd.get_rank():
+      print(" RANK {} loading cases..".format(rank))
+      dataset = utils.load_case_parallel(**inputs["data_load"])
+      dataset = np.vstack([x for x in dataset if x is not None])
+    bkd._COMM.Barrier()
+else:
+  dataset = utils.load_case_parallel(**inputs["data_load"])
+  dataset = np.vstack([x for x in dataset if x is not None])
+
 print("> Map dataset on DD elements")
 dataset = dd_fom.map_sol_on_elements(dataset, map_on_ports=True)
 

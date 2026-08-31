@@ -8,7 +8,7 @@ from .basic import Solver
 
 
 class GaussNewton(Solver):
-  """
+  r"""
   A solver for optimization problems using the Gauss-Newton method.
 
   This class implements the Gauss-Newton method, which is used to solve 
@@ -36,8 +36,20 @@ class GaussNewton(Solver):
   :type maxit: int
   :param stepsize_min: Minimum step size for the line search. Defaults to 1e-10.
   :type stepsize_min: float
+  :param iostep: Store every ``iostep``-th solution during time integration.
+                 Defaults to 1.
+  :type iostep: int
   :param verbose: Whether to print iteration details. Defaults to False.
   :type verbose: bool
+  :param distributed: Whether the solver is used in a distributed execution.
+                      Defaults to False.
+  :type distributed: bool
+  :param use_line_search: Whether to use Armijo backtracking. If false, the
+                          full Gauss-Newton step is used. Defaults to True.
+  :type use_line_search: bool
+  :param preconditioner: Reserved for iterative sparse linear solvers. The
+                         current least-squares implementation does not use it.
+  :type preconditioner: str or None
   """
 
   def __init__(
@@ -46,14 +58,22 @@ class GaussNewton(Solver):
     tol: float = 1e-3,
     maxit: int = 20,
     stepsize_min: float = 1e-10,
-    verbose: bool = False
+    iostep: int = 1,
+    verbose: bool = False,
+    distributed: bool = False,
+    use_line_search: bool = True,
+    preconditioner: str | None = None,
   ) -> None:
     super(GaussNewton, self).__init__(
       model=model,
       tol=tol,
       maxit=maxit,
       stepsize_min=stepsize_min,
-      verbose=verbose
+      iostep=iostep,
+      verbose=verbose,
+      distributed=distributed,
+      use_line_search=use_line_search,
+      preconditioner=preconditioner,
     )
     self.squared_res = True
 
@@ -61,7 +81,7 @@ class GaussNewton(Solver):
     self,
     x0: np.ndarray
   ) -> dtypes.SOL_TYPE:
-    """
+    r"""
     Solve a minimization problem using the Gauss-Newton method.
 
     :param x0: Initial guess.
@@ -101,8 +121,11 @@ class GaussNewton(Solver):
       self.model.runtime["total"] += delta
       self.model.runtime["lin_solve"] += delta
       # > Armijo line search
-      eval_res_tol = lambda stepsize: res_norm+2e-4*stepsize*(minval-res_norm)
-      x, res, jac, res_norm, stepsize = self.line_search(x, dx, eval_res_tol)
+      if self.use_line_search:
+        eval_res_tol = lambda stepsize: res_norm+2e-4*stepsize*(minval-res_norm)
+        x, res, jac, res_norm, stepsize = self.line_search(x, dx, eval_res_tol)
+      else:
+        x, res, jac, res_norm, stepsize = self.full_step(x, dx)
       # > Update
       start = time()
       it += 1
@@ -119,7 +142,9 @@ class GaussNewton(Solver):
       if np.isnan(res_norm):
         flag = 2
         break
-    if (it == self.maxit):
+    # Gauss-Newton converges on the gradient norm stored in conv_hist.
+    # Preserve success or a more specific termination reason at maxit.
+    if (flag == 0 and conv_hist[-1] >= self.tol and it >= self.maxit):
       flag = 3
     # Return result
     # ---------------

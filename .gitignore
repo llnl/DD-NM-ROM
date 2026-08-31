@@ -1,0 +1,12 @@
+*.pyc
+**/__pycache__/**
+
+PATHS.txt
+conda/llnl_toss/third_party/
+.venv/*
+venv_path.txt*
+
+*.core
+build/
+
+**spindle_bootstrap**

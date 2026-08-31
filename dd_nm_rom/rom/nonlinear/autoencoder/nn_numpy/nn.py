@@ -6,6 +6,7 @@ import torch
 
 from dd_nm_rom.ops import sp_diag
 from dd_nm_rom.rom.utils import hyper_red as hr
+from dd_nm_rom.utils import parallel_print
 import dd_nm_rom.backend as bkd
 
 from . import activation as act_mod
@@ -30,15 +31,37 @@ class Block(object):
     self.w = self._w
     self.activation = self._activation
 
+
+  def __eq__(self, other):
+    comp = (self.input_dim == other.input_dim)
+    comp &= (self.latent_dim == other.latent_dim)
+    comp &= (len(self.w) == len(other.w))
+    for (k,v) in self.w.items():
+      comp &= ((k in other.w) and (bkd.same_ptr(v, other.w[k]) or bkd.tensor_eq(v, other.w[k], check_indices=True)))
+    return comp
+
+  @classmethod
+  def makeShared(cls, other):
+    """
+    Makes a shallow copy of this autoencoder such that all tensors are created using views of those owned by other
+    """
+    view = cls.__new__(cls)
+    view.config = copy.copy(other.config)
+    view.input_dim = other.input_dim
+    view.latent_dim = other.latent_dim
+    view.name = getattr(other, "name", cls.__name__.lower())
+    view._activation = copy.copy(other._activation)
+    view.activation = view._activation
+    view.w = {k: copy.copy(v) for (k, v) in other.w.items()}
+    view._w = view.w
+    return view
+
   def set_weights(self):
     self._w = self.config["weights"]
     self._w["ref"] = self.config["ref"]
     self._w["scale"] = self.config["scale"]
     self._w["ov_scale"] = 1.0/self.config["scale"]
-    for k in ("scale", "ov_scale"):
-      self._w[k+"_diag"] = sp_diag(self._w[k])
 
-    # TODO: fix this
     if bkd.is_torch_backend():
       w_torch = {}
       for (k, b) in self._w.items():
@@ -47,19 +70,30 @@ class Block(object):
           w_torch[k] = b
         elif isinstance(b, sp.spmatrix):
           if sp.isspmatrix_csr(b):
-            b = bkd.to_sp_backend(b)
-            w_torch[k] = b
+            w_torch[k] = bkd.to_sp_backend(b)
           else:
-            b = bkd.to_sp_backend(bkd.to_sparse(b))
-            w_torch[k] = b
+            w_torch[k] = bkd.to_sp_coo_backend(b.tocoo())
         elif isinstance(b, torch.Tensor):
           w_torch[k] = b
         else:
           raise RuntimeError("Unexpected type for key {}: type = {}, {}".format(k, type(b), b))
       self._w = w_torch
 
+    for k in ("scale", "ov_scale"):
+      self._w[k+"_diag"] = sp_diag(self._w[k])
+
   def __call__(self, x, with_jac=True):
     return self.fun_jac(x) if with_jac else self.fun(x)
+
+  def _warmup_activation(self, activation, size, reference):
+    if not bkd.is_torch_backend():
+      return
+    act_mod.warmup(
+      activation,
+      int(size),
+      device=bkd.device(),
+      dtype=reference.dtype
+    )
 
   @abc.abstractmethod
   def fun(self, x):
@@ -84,6 +118,19 @@ class Encoder(Block):
     self._w["W1_scale"] = self._w["W1"] @ self._w["ov_scale_diag"]
     self._w["b1_ref"] = self._w["b1"] - self._w["W1_scale"] @ self._w["ref"]
 
+
+  def __eq__(self, other):
+    comp = (self.name == other.name)
+    comp &= super().__eq__(other)
+    return comp
+
+  def compile_activations(self):
+    self._warmup_activation(
+      self.activation,
+      self.w["b1_ref"].shape[0],
+      self.w["b1_ref"]
+    )
+
   def fun(self, x):
     # Apply encoder
     z = self.w["W1_scale"] @ x + self.w["b1_ref"]
@@ -96,7 +143,10 @@ class Encoder(Block):
     z = self.w["W1_scale"] @ x + self.w["b1_ref"]
     z, dz = self.activation(z, with_jac=True)
     z = self.w["W2"] @ z
-    jac = self.w["W2"] @ dz @ self.w["W1_scale"]
+    if bkd.is_torch_backend():
+      jac = (self.w["W2"] * dz.unsqueeze(0)) @ self.w["W1_scale"]
+    else:
+      jac = self.w["W2"] @ dz @ self.w["W1_scale"]
     # Return output and Jacobian
     return z, jac
 
@@ -113,6 +163,35 @@ class Decoder(Block):
     self._w_hr = None
     self.hr_active = False
 
+  def __eq__(self, other):
+    comp = (self.name == other.name)
+    comp &= super().__eq__(other)
+    return comp
+
+  def compile_activations(self):
+    self._warmup_activation(
+      self.activation,
+      self.w["b1"].shape[0],
+      self.w["b1"]
+    )
+
+
+  @classmethod
+  def makeShared(cls, other):
+    view = cls.__new__(cls)
+    view.config = copy.copy(other.config)
+    view.input_dim = other.input_dim
+    view.latent_dim = other.latent_dim
+    view._activation = copy.copy(other._activation)
+    view.activation = view._activation
+    view._w = {k: copy.copy(v) for (k, v) in other._w.items()}
+    view.w = view._w
+    view._w_hr = other._w_hr
+    view.hr_active = other.hr_active
+    view.name = other.name
+    return view
+
+  
   def set_weights(self):
     super(Decoder, self).set_weights()
     self._w["scale_W2"] = self._w["scale_diag"] @ self._w["W2"]
@@ -200,7 +279,10 @@ class Decoder(Block):
     x = self.w["W1"] @ z + self.w["b1"]
     x, dx = self.activation(x, with_jac=True)
     x = self.w["scale_W2"] @ x + self.w["ref"]
-    jac = self.w["scale_W2"] @ dx @ self.w["W1"]
+    if bkd.is_torch_backend():
+      jac = self.w["scale_W2"] @ sp_diag(dx) @ self.w["W1"]
+    else:
+      jac = self.w["scale_W2"] @ dx @ self.w["W1"]
     # Return output and Jacobian
     return x, jac
 
@@ -221,9 +303,51 @@ class Autoencoder(object):
     self.decoder = Decoder(self.config["decoder"])
     self.encoder = Encoder(self.config["encoder"])
 
+
+  @classmethod
+  def makeShared(cls, other):
+    """
+    Makes a shallow copy of this autoencoder such that all tensors are created using views of those owned by other
+    """
+    import tracemalloc
+    if not tracemalloc.is_tracing():
+      mem_start = bkd._start_mem_trace(True)
+    else:
+      mem_start = tracemalloc.get_traced_memory()
+
+    view = cls.__new__(cls)
+    view.name = other.name
+    view.config = copy.copy(other.config)
+    view.input_dim = other.input_dim
+    view.latent_dim = other.latent_dim
+    view.activation = other.activation
+    view.decoder = Decoder.makeShared(other.decoder)
+    view.encoder = Encoder.makeShared(other.encoder)
+    mem_end = tracemalloc.get_traced_memory()
+    bkd._get_mem_trace_stats(mem_start, mem_end, print_stats=True)
+
+    return view
+
+  def __copy__(self):
+    return Autoencoder(copy.copy(self.config))
+
+
   def __call__(self, x):
     return self.decoder(self.encoder(x, with_jac=False), with_jac=False)
 
+  def compile_activations(self):
+    self.encoder.compile_activations()
+    self.decoder.compile_activations()
+
+  def __eq__(self, other):
+    comp = (self.name == other.name)
+    #comp &= (self.config == other.config)
+    comp &= (self.input_dim == other.input_dim)
+    comp &= (self.latent_dim == other.latent_dim)
+    comp &= (self.decoder == other.decoder)
+    comp &= (self.encoder == other.encoder)
+    return comp
+  
   def set_hr_mode(
     self,
     active=False,
@@ -243,6 +367,7 @@ class MultiAutoencoder(Autoencoder):
     self.indices = indices
     self.input_dim = input_dim
     self.autoencoders = autoencoders
+
     super(MultiAutoencoder, self).__init__(self.get_config())
 
   # ROM dimensions

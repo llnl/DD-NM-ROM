@@ -4,6 +4,7 @@ __all__ = [
   "SinPeak",
   "PoissonForce",
   "MultiPeak",
+  "MultiPeakSgn",
   "MultiPeakGen",
   "MultiPeakGen2",
   "ElasticityForce"

@@ -59,7 +59,6 @@ class DiffOperators(object):
 
     if self.upwind:
       if self.upwind_order == 1:
-          print('using first order')
           return self.build_upwind_1st()
       else:
           return self.build_upwind_2nd_gen()
@@ -72,6 +71,7 @@ class DiffOperators(object):
       Di = self._build_op(axis, stencil=[ 1, -2, 1], diags=[-1, 0, 1])
       self.ops[f"A{axis}"] = (-0.5/h) * Ai
       self.ops["D"] = self.ops["D"] + (self.nu/h**2) * Di
+    self.ops = self._ops_to_backend()
     self.built = True
 
   def _build_op(
@@ -104,14 +104,21 @@ class DiffOperators(object):
         op += stencil[index] * bc_op
     # Map over 2D grid
     if (axis == "x"):
-      #op = torch.kron(torch.eye(n["y"]), op)
       op = sp.kron(sp.eye(n["y"]), op)
     else:
-      #op = torch.kron(op, torch.eye(n["x"]))
       op = sp.kron(op, sp.eye(n["x"]))
-    #return torch.sparse_csr_tensor(op_s.indptr, op_s.indices, op_s.data, op_s.shape)
-    #return op.to_sparse_csr()
     return op.tocsr()
+
+
+  def _ops_to_backend(self):
+    if bkd.is_torch_backend():
+        for op in self.ops:
+            if sp.issparse(self.ops[op]):
+                self.ops[op] = bkd.to_sp_backend(self.ops[op])
+            else:
+                self.ops[op] = bkd.to_backend(self.ops[op])
+    return self.ops
+
 
   def build_upwind_1st(self) -> None:
     """
@@ -135,6 +142,7 @@ class DiffOperators(object):
         Di = self._build_op(axis, stencil=[1, -2, 1], diags=[-1, 0, 1])
         self.ops["D"] = self.ops["D"] + (self.nu/h**2) * Di
 
+    self.ops = self._ops_to_backend()
     self.built = True
 
 
@@ -155,6 +163,7 @@ class DiffOperators(object):
           # Standard second-order central for diffusion
           Di = self._build_op(axis, stencil=[1, -2, 1], diags=[-1, 0, 1])
           self.ops["D"] = self.ops["D"] + (self.nu/h**2) * Di
+      self.ops = self._ops_to_backend()
       self.built = True
 
   def _build_extended_op(
@@ -238,12 +247,7 @@ class DiffOperators(object):
           Di = self._build_op(axis, stencil=[1, -2, 1], diags=[-1, 0, 1])
           self.ops["D"] = self.ops["D"] + (self.nu/h**2) * Di
 
-      if bkd.is_torch_backend():
-          for op in self.ops:
-              if sp.issparse(self.ops[op]):
-                  self.ops[op] = bkd.to_sp_backend(self.ops[op])
-              else:
-                  self.ops[op] = bkd.to_backend(self.ops[op])
+      self.ops = self._ops_to_backend()
       self.built = True
 
   def _build_extended_op_gen(

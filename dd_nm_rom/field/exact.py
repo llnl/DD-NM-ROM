@@ -37,7 +37,8 @@ class Burgers2DExact(BasicField):
     mesh: mesh_mod.MESH_TYPES,
     nu: float = 1e-2,
     a_lim: List[float] = [1e0, 1e4],
-    k_lim: List[float] = [5.0, 25.0]
+    k_lim: List[float] = [5.0, 25.0],
+    use_qmc: bool = True
   ) -> None:
     super(Burgers2DExact, self).__init__(mesh)
     self.x0 = 1.0
@@ -46,11 +47,21 @@ class Burgers2DExact(BasicField):
     self.Re = 1/self.nu
     self.a_lim = list(a_lim)
     self.k_lim = list(k_lim)
+    self.use_qmc = use_qmc
 
   # Design space
   # ===================================
   def _init_design_space(self) -> None:
     self.design_space = np.array([self.a_lim, self.k_lim]).T
+
+  def construct_design_mat(
+    self,
+    n_samples: int
+  ) -> np.ndarray:
+    if self.use_qmc:
+      dmat, _ = super(Burgers2DExact, self).construct_design_mat_qmc(n_samples)
+      return dmat
+    return super(Burgers2DExact, self).construct_design_mat(n_samples)
 
   def set_params(
     self,

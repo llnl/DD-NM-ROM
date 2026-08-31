@@ -71,6 +71,21 @@ print("\nLoading data ...")
 dataset = utils.load_case_parallel(**inputs["data_load"])
 dataset = np.vstack([x for x in dataset if x is not None])
 
+'''
+if bkd.distributed():
+  for rank in range(bkd.get_nranks()):
+    if rank == bkd.get_rank():
+      print(" RANK {} loading cases..".format(rank))
+      dataset = utils.load_case_parallel(**inputs["data_load"])
+      dataset = np.vstack([x for x in dataset if x is not None])
+    bkd._COMM.Barrier()
+else:
+  dataset = utils.load_case_parallel(**inputs["data_load"])
+  dataset = np.vstack([x for x in dataset if x is not None])
+'''
+
+bkd._COMM.Barrier()
+
 bkd._COMM.Barrier()
 print("> Map dataset on DD elements")
 dataset = dd_fom.map_sol_on_elements(dataset, map_on_ports=True)

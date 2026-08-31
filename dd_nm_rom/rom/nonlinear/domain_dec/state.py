@@ -41,10 +41,11 @@ class SubdomainElementStateROM(object):
     self._iden = copy.copy(self.state_fom.iden)
     self._iden_uv = copy.copy(self.state_fom.iden_uv)
     if bkd.is_torch_backend():
-      self._iden = bkd.to_sp_backend(self._iden)
-      self._iden_uv = bkd.to_sp_backend(self._iden_uv.tocsr())
+      self._iden = bkd.to_sp_coo_backend(self._iden)
+      self._iden_uv = bkd.to_sp_coo_backend(self._iden_uv)
     self._ops = ops.map_nested_dict(self.state_fom.ops, copy.copy)
     self._bc_f = ops.map_nested_dict(self.state_fom.bc_f, copy.copy)
+
 
   # Hyper-reduction (HR)
   # ===================================

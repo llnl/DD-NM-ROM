@@ -6,7 +6,7 @@ from ... import backend as bkd
 
 class DDIndices(object):
   """
-  Class for generating residual, interior, and interface subdomain 
+  Class for generating residual, interior, and interface subdomain
   indices for a steady-state 2D Burgers FOM.
   """
 

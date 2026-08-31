@@ -14,13 +14,15 @@ class SinPeak(SinMultiPeak):
     self,
     mesh: mesh_mod.MeshDD,
     mu_lim: List[float] = [0.9, 1.1],
-    bc_type: str = "neumann"
+    bc_type: str = "neumann",
+    use_qmc: bool = True
   ) -> None:
     super(SinPeak, self).__init__(
       mesh=mesh,
       mu_lim=mu_lim,
       forced_config=None,
-      bc_type=bc_type
+      bc_type=bc_type,
+      use_qmc=use_qmc
     )
 
   # Design space
@@ -37,6 +39,7 @@ class SinPeak(SinMultiPeak):
 
   def _convert_dmat_to_mu(
     self,
-    dmat: np.ndarray
+    dmat: np.ndarray,
+    mask: np.ndarray = None
   ) -> np.ndarray:
-    return self.configs.reshape(1,-1) * dmat
+    return np.tile(dmat, (1, self.configs.size)) * self.configs.reshape(1,-1)

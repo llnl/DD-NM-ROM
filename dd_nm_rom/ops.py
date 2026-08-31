@@ -3,11 +3,14 @@ import numpy as np
 import scipy as sp
 import torch.sparse
 
+import torch_sla
+
 from typing import Any, Dict, List
 from dd_nm_rom import backend as bkd
 
 def sp_diag(
-  x: np.ndarray
+  x: np.ndarray,
+  format : str = "csr"
 ) -> sp.sparse.spmatrix:
   """
   Create a sparse diagonal matrix from a 1D NumPy array.
@@ -26,7 +29,35 @@ def sp_diag(
   if isinstance(x, np.ndarray):
     return sp.sparse.spdiags(x, 0, x.size, x.size)
   else:
-    return bkd.to_sp_backend(torch.diag(x, diagonal=0))
+    # (x.size[0], x.size[1])
+    if format == "csr":
+      return torch_sla.SparseTensor.diag(x, device=x.device).to_csr()
+    else:
+      return torch_sla.SparseTensor.diag(x, device=x.device).to_torch_sparse()
+
+def sp_diag_sla(
+  x: np.ndarray,
+  format : str = "csr"
+) -> sp.sparse.spmatrix:
+  """
+  Create a sparse diagonal matrix from a 1D NumPy array.
+
+  :param x: A 1D NumPy array to be used as the diagonal of the matrix.
+  :type x: np.ndarray
+
+  :return: A sparse diagonal matrix with `x` as the main diagonal.
+  :rtype: sp.sparse.spmatrix
+
+  :raises ValueError: If `x` is not a 1D array.
+  """
+  if (x.ndim != 1):
+    raise ValueError("A 1D array is needed to build a sparse diagonal matrix.")
+
+  if isinstance(x, np.ndarray):
+    return sp.sparse.spdiags(x, 0, x.size, x.size)
+  else:
+    return torch_sla.SparseTensor.diag(x, device=x.device)
+
 
 def map_nested_dict(
   obj: Any,
@@ -81,7 +112,8 @@ def face_splitting(
   return sp.linalg.khatri_rao(A.T, B.T).T
 
 def generate_combs(
-  arrays_1d: List[np.ndarray]
+  arrays_1d: List[np.ndarray],
+  **kwargs
 ) -> np.ndarray:
   """
   Generate all combinations of elements from multiple 1D arrays.
@@ -97,7 +129,8 @@ def generate_combs(
            elements from the input arrays.
   :rtype: np.ndarray
   """
-  combs = np.meshgrid(*arrays_1d, indexing="ij")
+
+  combs = np.meshgrid(*arrays_1d, indexing="ij", **kwargs)
   return np.array(combs).T.reshape(-1,len(arrays_1d))
 
 def compute_stats(

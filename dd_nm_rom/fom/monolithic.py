@@ -82,7 +82,11 @@ class Burgers2D(object):
     self.iden_uv = sp.eye(self.get_ndof()).tocsr()
     self.iden = bkd.to_sp_backend(self.iden)
     self.iden_uv = bkd.to_sp_backend(self.iden_uv)
+    if bkd.is_torch_backend():
+      self.iden = self.iden.to_sparse_coo()
+      self.iden_uv = self.iden_uv.to_sparse_coo()
     self.built = True
+
 
   def build_bc(
     self,
@@ -119,7 +123,11 @@ class Burgers2D(object):
     # Backward Euler for integration
     if (not self.steady):
       res = x - self.x_old - self.dt*res
-      jac = self.iden_uv - self.dt*jac
+      if bkd.is_torch_backend():
+        #jac = self.iden_uv.to_dense() - self.dt*jac.to_sparse_coo()
+        jac = self.iden_uv - self.dt*jac.to_sparse_coo()
+      else:
+        jac = self.iden_uv - self.dt*jac
     delta = time()-start
     jac = bkd.to_sp_backend(jac)
     self.runtime["total"] += delta
@@ -137,16 +145,24 @@ class Burgers2D(object):
     for axis in ("x", "y"):
       adv_act[axis] = {}
       for k in ("u", "v"):
-        adv_act[axis][k] = self.ops[f"A{axis}"] @ uv[k] \
+        if bkd.is_torch_backend():
+          bc = bkd.to_backend(self.bc_f[k]["A"][axis])
+          adv_act[axis][k] = self.ops[f"A{axis}"] @ uv[k] - bc
+          del bc
+        else:
+          adv_act[axis][k] = self.ops[f"A{axis}"] @ uv[k] \
                          - self.bc_f[k]["A"][axis]
     # Compute residual
     dx = []
     for k in ("u", "v"):
+      bc = bkd.to_backend(self.bc_f[k]["D"]) if bkd.is_torch_backend() else self.bc_f[k]["D"]
       dx_k = uv_diag["u"] @ adv_act["x"][k] \
            + uv_diag["v"] @ adv_act["y"][k] \
-           + self.ops["D"] @ uv[k] + self.bc_f[k]["D"]
+           + self.ops["D"] @ uv[k] + bc
       dx.append(dx_k)
-    res = np.concatenate(dx)
+      if bkd.is_torch_backend():
+        del bc
+    res = torch.cat(dx) if bkd.is_torch_backend() else np.concatenate(dx)
     # Compute Jacobian
     jac_xx = uv_diag["u"] @ self.ops["Ax"] \
            + uv_diag["v"] @ self.ops["Ay"] \
@@ -155,11 +171,12 @@ class Burgers2D(object):
     jac_uv = ops.sp_diag(adv_act["y"]["u"])
     jac_vu = ops.sp_diag(adv_act["x"]["v"])
     jac_vv = ops.sp_diag(adv_act["y"]["v"]) + jac_xx
-    jac = sp.bmat(
-      [[jac_uu, jac_uv],
-       [jac_vu, jac_vv]],
-      format="csr"
-    )
+    jac = [[jac_uu, jac_uv],
+           [jac_vu, jac_vv]]
+    if bkd.is_torch_backend():
+        jac = bkd.torch_bmat(jac)
+    else:
+        jac = sp.bmat(jac, format="csr")
     return res, jac
 
   def extract_uv(
@@ -197,7 +214,7 @@ class Burgers2D(object):
     start = time()
     if (x0 is None):
       if bkd.is_torch_backend():
-        x0 = torch.zeros(self.get_ndof())
+        x0 = torch.zeros(self.get_ndof(), device=bkd.device())
       else:
         x0 = np.zeros(self.get_ndof())
     else:
@@ -220,6 +237,8 @@ class Burgers2D(object):
     x, res, *_, flag = solver(x0, dt, nt)
     # Return solution
     uv = self.extract_uv(x, diag=False)
+    if not isinstance(flag, List):
+      flag = [flag]
     converged = True if (flag[-1] == 0) else False
     return uv, res, converged
 
@@ -284,18 +303,13 @@ class Burgers2D(object):
     for axis in ("x", "y"):
       vel_component = "u" if axis == "x" else "v"
       vel = uv[vel_component]
+      # Diagonal selection matrices
       if bkd.is_torch_backend():
-        pos_mask = vel.ge(0.0)
-        neg_mask = ~pos_mask
-
-        # Diagonal selection matrices
-        #P = torch.where(vel >= 0.0, 1.0, 0.0) # shape (n, n)
-        #N = torch.where(vel < 0.0, 1.0, 0.0)  # shape (n, n)
-        P = torch.sparse.spdiags(torch.where(vel >= 0.0, 1.0, 0.0).cpu(), torch.tensor([0]).cpu(), shape=(vel.size(0), vel.size(0)), layout=torch.sparse_csr).cuda() # shape (n, n)
-        N = torch.sparse.spdiags(torch.where(vel < 0.0, 1.0, 0.0).cpu(), torch.tensor([0]).cpu(), shape=(vel.size(0), vel.size(0)), layout=torch.sparse_csr).cuda()  # shape (n, n)
+        pos_mask = vel.ge(0.0).to(dtype=vel.dtype)
+        neg_mask = vel.lt(0.0).to(dtype=vel.dtype)
       else:
         pos_mask = (vel >= 0).astype(float)
-        neg_mask = 1-pos_mask #(vel < 0)
+        neg_mask = 1.0 - pos_mask
 
         # Diagonal selection matrices
         P = sp.diags(pos_mask)  # shape (n, n)
@@ -305,7 +319,15 @@ class Burgers2D(object):
       A_neg = self.ops[f"A{axis}_neg"]
 
       # Efficient blending
-      A_blend = P @ A_pos + N @ A_neg
+      if bkd.is_torch_backend():
+        A_pos = A_pos.to_dense() if A_pos.layout != torch.strided else A_pos
+        A_neg = A_neg.to_dense() if A_neg.layout != torch.strided else A_neg
+        A_blend = (
+          pos_mask.unsqueeze(1) * A_pos
+          + neg_mask.unsqueeze(1) * A_neg
+        )
+      else:
+        A_blend = P @ A_pos + N @ A_neg
 
       jac_operators[f"A{axis}"] = A_blend
 

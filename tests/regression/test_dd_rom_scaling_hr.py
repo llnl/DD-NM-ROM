@@ -9,6 +9,8 @@ import torch
 import torch.distributed as dist
 import torch.testing
 
+from pyinstrument import Profiler
+
 from dd_nm_rom import backend as bkd
 from dd_nm_rom.utils import parallel_print
 
@@ -22,24 +24,40 @@ from dd_nm_rom.rom.utils import pod as pod_mod
 from dd_nm_rom.elements import mesh as mesh_mod
 
 def setup_module(module):
+    #from dd_nm_rom import env
+    #env.set(**inputs["env"])
+
     #bkd.set(backend="numpy", device="cpu", seed=0)
     bkd.set(backend="torch", device="cuda", seed=0)
 
 
 def teardown_module(module):
-    bkd.finalize_distributed()
+    if bkd.is_torch_backend():
+        bkd.finalize_distributed()
 
 
 def test_ddnmrom_simple():
+    rank = bkd.get_rank()
+
+    #inputs_file = Path(Path.cwd(), "./inputs/test_dd_nmrom_simple.json").resolve()
     inputs_file = "./tests/inputs/test_dd_nmrom_simple.json"
     with open(inputs_file) as file:
         inputs = json.load(file)
+
+    profiler = Profiler()
+    profile_out = "profiles/test_dd_rom_profile_gpu"
+    if bkd.distributed():
+        profile_out += "_{}_{}".format(bkd.get_nranks(), bkd.get_rank())
 
     print("\nInitialization ...")
     # Mesh
     mesh = utils.get_class(modules=[mesh_mod], **inputs["mesh"])
     mesh.build()
     X, Y = mesh.grid
+
+    fom_subs_per_rank = (mesh.n_sub) // bkd.get_nranks()
+    print(" SUBDOMAINS PER RANK: {}".format(fom_subs_per_rank))
+
     # Field
     field = utils.get_class(modules=[field_mod],
                             name=inputs["field"]["name"]
@@ -53,8 +71,10 @@ def test_ddnmrom_simple():
     # DD-FOM
     dd_fom = utils.get_class(modules=[fom_mod],
                              name="DDBurgers2D"
-    )(monolithic=fom, **inputs["dd_fom"]["kwargs"])
+    )(monolithic=fom, subs_per_rank=fom_subs_per_rank, **inputs["dd_fom"]["kwargs"])
     dd_fom.build()
+
+    #return
 
     # Data loading
     # =====================================
@@ -80,10 +100,11 @@ def test_ddnmrom_simple():
     for icase in test_cases:
         # Test case set up
         # ---------------
-        print(icase)
+        #print(icase)
         x0 = icase["snapshots"][0]
+        #parallel_print("RANK {}: SNAPSHOTS = ({}) {}".format(bkd.get_rank(), x0.shape, x0))
         solver = icase["solver"]
-        print(solver)
+        #print(solver)
         uv_fom = icase["solution"]
         runtime_fom = icase["runtime"]
         # > Time instants plotted
@@ -91,7 +112,7 @@ def test_ddnmrom_simple():
         # ieval = np.arange(len(icase["time"]))[::25]
         teval = icase["time"].squeeze()[::25*solver['iostep']]
         ieval = (np.arange(len(icase["time"]))[::25*solver['iostep']])//solver['iostep']
-        print(teval,ieval)
+        #print(teval,ieval)
         # DD-FOM
         # ---------------
         # > Building
@@ -118,17 +139,24 @@ def test_ddnmrom_simple():
                                    hr_small_ports_dim=5,
                                    constraint_type="strong",
                                    n_constraints_weak=-1,
-                                   scaling=-1
+                                   scaling=-1,
+                                   subs_per_rank=fom_subs_per_rank
         )
 
+        profiler.start()
         # >> Solving
         solver["verbose"] = True
-        uv_rom, *_, iconverged = dd_rom.solve(
+        solver["tol"] = 1.0e-8
+        uv_rom, z, lambdas, res, iconverged = dd_rom.solve(
             x0=dd_rom.get_init_sol(x=x0),
             runtime=0.0,
             use_guess=False,
             **solver
         )
+
+        profiler.stop()
+        with open(profile_out + ".out", 'w') as file:
+            profiler.print(file)
 
         # >> Statistics - Single case
         iruntime = dd_rom.runtime
@@ -150,7 +178,25 @@ def test_ddnmrom_simple():
             IERROR = {'L2_timemax': 0.001960687233002323, 'L2_timeavg': 0.001481475956931282, 'Linf_timeavg': 0.5042307588169733, 'Linf_timemax': 0.6460970156614413}
             ISPEEDUP = {'total': 23.68131718066232, 'lin_solve': 234.93744721312828, 'res_jac': 0.29337850820847583}
         '''
+        '''
+        # for nt = 200:
         np.testing.assert_almost_equal(ierror['L2_timemax'], 0.001960687233002323)
         np.testing.assert_almost_equal(ierror['L2_timeavg'], 0.001481475956931282)
         np.testing.assert_almost_equal(ierror['Linf_timeavg'], 0.5042307588169733)
         np.testing.assert_almost_equal(ierror['Linf_timemax'], 0.6460970156614413)
+        '''
+
+        # for nt = 5:
+        '''
+        CPU results:
+            Solver terminated after 2 iterations with residual norm of 9.8904e-08.
+            Execution time: 1.03765e+00 s
+            DDROM SOLVE: RANK 0: POST_SOLVE X size = torch.Size([1280, 3]), res size = 5
+            IRUNTIME = {'total': 4.215246915817261, 'lin_solve': 0.17498230934143066, 'res_jac': 4.005152702331543}
+            IERROR = {'L2_timemax': 0.00024161770924130115, 'L2_timeavg': 0.00020730815822363234, 'Linf_timeavg': 0.028933408273142558, 'Linf_timemax': 0.03264850879615309}
+            ISPEEDUP = {'total': 241.822376204516, 'lin_solve': 5759.836456932482, 'res_jac': 2.8373422538762822}
+        '''
+        np.testing.assert_almost_equal(ierror['L2_timemax'], 0.00024161770924130115)
+        np.testing.assert_almost_equal(ierror['L2_timeavg'], 0.00020730815822363234)
+        np.testing.assert_almost_equal(ierror['Linf_timeavg'], 0.028933408273142558)
+        np.testing.assert_almost_equal(ierror['Linf_timemax'], 0.03264850879615309)

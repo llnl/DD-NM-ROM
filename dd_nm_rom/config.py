@@ -1,4 +1,7 @@
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 # General options
 _DDNMROM_VERBOSE = int(0)
@@ -48,17 +51,15 @@ _env_vars = {
 
 
 def print_config_env():
-  print("----------------------")
-  print("DDNMROM configuration:")
-  print("----------------------")
+  lines = ["----------------------", "DDNMROM configuration:", "----------------------"]
   for (var, default_val) in _env_vars.items():
     env_value = os.getenv(var)
     if env_value is None:
-      print("   '{}': {} (default)".format(var, default_val))
+      lines.append("   '{}': {} (default)".format(var, default_val))
     else:
-      print("   '{}': {} (env)".format(var, env_value))
-  print("----------------------")
-  print("")
+      lines.append("   '{}': {} (env)".format(var, env_value))
+  lines.extend(["----------------------", ""])
+  logger.info("\n".join(lines))
 
 
 def get_config_val(var, get_default=True):
@@ -66,7 +67,7 @@ def get_config_val(var, get_default=True):
     raise RuntimeError("Tried to find unexpected config var '{}'".format(var))
   
   if get_default:
-    print(" GETTING DEFAULT FOR '{}'".format(var))
+    logger.debug("GETTING DEFAULT FOR '%s'", var)
     value = os.getenv(var, _env_vars[var])
     if value is None:
       raise RuntimeError(" Error getting config var '{}'".format(var))
@@ -100,7 +101,10 @@ def update_from_env(var, current=None, verbose=True):
 
     # print a message if the existing value changed from the existing
     if verbose and _current != opt:
-      print(" *** Overriding option from environment! '{}' (was {}, now {})".format(var, _current, opt))
+      logger.debug(
+        "Overriding option from environment! '%s' (was %s, now %s)",
+        var, _current, opt,
+      )
     return opt
   else:
     # if env variable is not defined, then we do nothing and return current value

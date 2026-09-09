@@ -4,7 +4,6 @@ from typing import List, Union
 from dd_nm_rom import ops
 from dd_nm_rom.elements import mesh as mesh_mod
 from dd_nm_rom.elements import bound_cond as bc_mod
-import dd_nm_rom.backend as bkd
 
 from .basic import BasicField
 
@@ -50,10 +49,8 @@ class SinMultiPeak(BasicField):
     if self.use_qmc:
       self.design_space = [self.mu_lim]*self.mesh.n_sub
       self.design_space = np.array(self.design_space).T
-
     else:
       self.configs = ops.generate_combs([np.arange(2)]*self.mesh.n_sub)[1:]
-
 
       if (self.forced_config is not None):
         self.configs += self.forced_config.reshape(1,-1)
@@ -62,10 +59,8 @@ class SinMultiPeak(BasicField):
       # Define design space
       self.design_space = [[0,len(self.configs)]] + [self.mu_lim]*self.mesh.n_sub
       self.design_space = np.array(self.design_space).T
-      if bkd.distributed():
-        self.configs = bkd._COMM.bcast(self.configs)
-    if bkd.distributed():
-      self.design_space = bkd._COMM.bcast(self.design_space)
+      self.configs = self._broadcast(self.configs)
+    self.design_space = self._broadcast(self.design_space)
 
   def sample_design_space(self) -> np.ndarray:
     s = 0.0
@@ -76,9 +71,7 @@ class SinMultiPeak(BasicField):
         config = config.astype(bool).astype(int)
       s = np.sum(config)
     mu = config * np.random.uniform(*self.mu_lim, size=self.mesh.n_sub)
-    if bkd.distributed():
-      mu = bkd._COMM.bcast(mu)
-    return mu
+    return self._broadcast(mu)
 
   def construct_design_mat(
     self,
@@ -108,14 +101,9 @@ class SinMultiPeak(BasicField):
     mask = None
     if self.use_qmc:
       dmat, mask = super(SinMultiPeak, self).construct_design_mat_qmc(n_samples)
-      if bkd.distributed():
-        dmat = bkd.bcast(dmat)
-        mask = bkd.bcast(mask)
     else:
       dmat = super(SinMultiPeak, self).construct_design_mat(n_samples)
-      if bkd.distributed():
-        dmat = bkd.bcast(dmat)
-    return self._convert_dmat_to_mu(dmat, mask)
+    return self._broadcast(self._convert_dmat_to_mu(dmat, mask))
 
   def _convert_dmat_to_mu(
     self,

@@ -35,7 +35,7 @@ class SinPeak(SinMultiPeak):
 
   def sample_design_space(self) -> np.ndarray:
     self.init_design_space()
-    return self.configs * np.random.uniform(*self.mu_lim)
+    return self._broadcast(self.configs * np.random.uniform(*self.mu_lim))
 
   def _convert_dmat_to_mu(
     self,

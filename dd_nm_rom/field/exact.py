@@ -60,8 +60,8 @@ class Burgers2DExact(BasicField):
   ) -> np.ndarray:
     if self.use_qmc:
       dmat, _ = super(Burgers2DExact, self).construct_design_mat_qmc(n_samples)
-      return dmat
-    return super(Burgers2DExact, self).construct_design_mat(n_samples)
+      return self._broadcast(dmat)
+    return self._broadcast(super(Burgers2DExact, self).construct_design_mat(n_samples))
 
   def set_params(
     self,

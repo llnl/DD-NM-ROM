@@ -132,6 +132,16 @@ jobs:
 
       - name: Run parallel tests at ranks 2 and 4
         run: |
+          # Validate the CPU MPI path before the full rank sweep.
+          mpiexec -n 2 \
+            "${VENV_PATH}/bin/python" -m pytest \
+            tests/test_backend.py \
+            -v --tb=short \
+            --with-mpi \
+            --backend=torch_cpu \
+            -m mpi \
+            -k test_distributed_parallel
+
           for ranks in 2 4; do
             mpiexec -n "${ranks}" \
               "${VENV_PATH}/bin/python" -m pytest tests \

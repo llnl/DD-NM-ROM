@@ -6,6 +6,7 @@ from scipy.stats import qmc
 from typing import Dict, Union
 from dd_nm_rom.elements import mesh as mesh_mod
 from dd_nm_rom.elements import bound_cond as bc_mod
+import dd_nm_rom.backend as bkd
 
 
 class BasicField(object):
@@ -45,6 +46,10 @@ class BasicField(object):
     if (self.design_space is None):
       self._init_design_space()
 
+  def _broadcast(self, value):
+    """Broadcast field sampling data consistently across distributed ranks."""
+    return bkd.bcast(value)
+
   @abc.abstractmethod
   def _init_design_space(self) -> None:
     """
@@ -61,7 +66,7 @@ class BasicField(object):
     :rtype: np.ndarray
     """
     self.init_design_space()
-    return self.construct_design_mat(n_samples=1).reshape(-1)
+    return self._broadcast(self.construct_design_mat(n_samples=1).reshape(-1))
 
   def construct_design_mat(
     self,
@@ -78,7 +83,7 @@ class BasicField(object):
     """
     if self.use_qmc:
       dmat, _ = self.construct_design_mat_qmc(n_samples)
-      return dmat
+      return self._broadcast(dmat)
 
     self.init_design_space()
     # Construct
@@ -86,7 +91,7 @@ class BasicField(object):
     dmat = lhs(ddim, int(n_samples))
     # Rescale
     amin, amax = self.design_space
-    return dmat * (amax - amin) + amin
+    return self._broadcast(dmat * (amax - amin) + amin)
 
   def construct_design_mat_qmc(
     self,

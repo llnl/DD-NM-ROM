@@ -9,6 +9,10 @@ on:
       - main
     types: [opened, synchronize, reopened, closed]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -20,6 +24,7 @@ jobs:
   setup-environment:
     name: Set up test environment
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -60,6 +65,7 @@ jobs:
     name: Serial tests
     needs: setup-environment
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       DDNMROM_VERBOSE: "1"
       DDNMROM_LOG_LEVEL: "20"
@@ -108,6 +114,7 @@ jobs:
     name: Parallel tests
     needs: setup-environment
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       DDNMROM_VERBOSE: "1"
       DDNMROM_LOG_LEVEL: "20"
@@ -135,7 +142,8 @@ jobs:
       - name: Run parallel tests at ranks 2 and 4
         run: |
           # Validate the CPU MPI path before the full rank sweep.
-          mpiexec -n 2 \
+          timeout --foreground --kill-after=10s 2m \
+            mpiexec -n 2 \
             "${VENV_PATH}/bin/python" -m pytest \
             tests/test_backend.py \
             -v --tb=short --timeout=120 \
@@ -145,7 +153,8 @@ jobs:
             -k test_distributed_parallel
 
           for ranks in 2 4; do
-            mpiexec -n "${ranks}" \
+            timeout --foreground --kill-after=10s 2m \
+              mpiexec -n "${ranks}" \
               "${VENV_PATH}/bin/python" -m pytest tests \
               -v --tb=short --timeout=120 \
               --with-mpi \

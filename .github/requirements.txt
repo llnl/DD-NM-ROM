@@ -18,4 +18,5 @@ tqdm
 typing-extensions
 pytest
 pytest-mpi
+pytest-timeout
 wheel

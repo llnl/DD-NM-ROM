@@ -2,6 +2,8 @@ name: DD-NM-ROM CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
     branches:
       - main
@@ -85,21 +87,21 @@ jobs:
       - name: Run NumPy unit tests
         run: |
           "${VENV_PATH}/bin/python" -m pytest tests \
-            -v --tb=short \
+            -v --tb=short --timeout=120 \
             --backend=numpy \
             -m "not packaging"
 
       - name: Run Torch CPU unit tests
         run: |
           "${VENV_PATH}/bin/python" -m pytest tests \
-            -v --tb=short \
+            -v --tb=short --timeout=120 \
             --backend=torch_cpu \
             -m "not packaging"
 
       - name: Run packaging tests
         run: |
           "${VENV_PATH}/bin/python" -m pytest tests \
-            -v --tb=short \
+            -v --tb=short --timeout=120 \
             -m packaging
 
   parallel-tests:
@@ -136,7 +138,7 @@ jobs:
           mpiexec -n 2 \
             "${VENV_PATH}/bin/python" -m pytest \
             tests/test_backend.py \
-            -v --tb=short \
+            -v --tb=short --timeout=120 \
             --with-mpi \
             --backend=torch_cpu \
             -m mpi \
@@ -145,7 +147,7 @@ jobs:
           for ranks in 2 4; do
             mpiexec -n "${ranks}" \
               "${VENV_PATH}/bin/python" -m pytest tests \
-              -v --tb=short \
+              -v --tb=short --timeout=120 \
               --with-mpi \
               --backend=torch_cpu \
               -m mpi

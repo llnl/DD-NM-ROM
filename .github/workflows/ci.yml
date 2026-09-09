@@ -90,7 +90,7 @@ jobs:
       - name: Run unit tests
         run: |
           "${VENV_PATH}/bin/python" -m pytest tests \
-            -vv -s --log-cli-level=INFO \
+            -v --tb=short \
             --backend="${{ matrix.backend }}" \
             -m "not packaging"
 
@@ -131,7 +131,7 @@ jobs:
         run: |
           mpiexec -n "${{ matrix.ranks }}" \
             "${VENV_PATH}/bin/python" -m pytest tests \
-            -vv -s --log-cli-level=INFO \
+            -v --tb=short \
             --with-mpi \
             --backend=torch_cpu \
             -m mpi
@@ -160,6 +160,6 @@ jobs:
       - name: Run packaging tests
         run: |
           "${VENV_PATH}/bin/python" -m pytest tests \
-            -vv -s --log-cli-level=INFO \
+            -v --tb=short \
             -m packaging \
             --backend=torch_cpu

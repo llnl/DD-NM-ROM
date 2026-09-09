@@ -91,14 +91,23 @@ class Encoder(Block):
   def fun_jac(self, x):
     h = self.w["W1_scale"] @ x + self.w["b1_ref"]
     a, da = self.activations[0](h, with_jac=True)
-    jac_chain = da @ self.w["W1_scale"]
+    if bkd.is_torch_backend():
+      jac_chain = da.unsqueeze(1) * self.w["W1_scale"].to_dense()
+    else:
+      jac_chain = da @ self.w["W1_scale"]
     for i, k in enumerate(self.hidden_keys[1:]):
       h = self.w[k] @ a
       a_next, da_next = self.activations[i+1](h, with_jac=True)
-      jac_chain = da_next @ self.w[k] @ jac_chain
+      if bkd.is_torch_backend():
+        jac_chain = da_next.unsqueeze(1) * (self.w[k].to_dense() @ jac_chain)
+      else:
+        jac_chain = da_next @ self.w[k] @ jac_chain
       a = a_next
     z = self.w[self.final_key] @ a
-    jac = self.w[self.final_key] @ jac_chain
+    if bkd.is_torch_backend():
+      jac = self.w[self.final_key].to_dense() @ jac_chain
+    else:
+      jac = self.w[self.final_key] @ jac_chain
     return z, jac
 
 
@@ -182,7 +191,10 @@ class Decoder(Block):
     x = self.w["W1"] @ z + self.w["b1"]
     x, dx = self.activation(x, with_jac=True)
     x = self.w["scale_W2"] @ x + self.w["ref"]
-    jac = self.w["scale_W2"] @ dx @ self.w["W1"]
+    if bkd.is_torch_backend():
+      jac = (self.w["scale_W2"].to_dense() * dx.unsqueeze(0)) @ self.w["W1"].to_dense()
+    else:
+      jac = self.w["scale_W2"] @ dx @ self.w["W1"]
     # Return output and Jacobian
     return x, jac
 
@@ -248,20 +260,29 @@ class MixedEncoder(object):
     return z
 
   def fun_jac(self, x):
-    z = np.zeros(self.latent_dim)
-    jac = sp.csr_matrix((self.latent_dim, self.input_dim))
+    if bkd.is_torch_backend():
+      z = torch.zeros(self.latent_dim, device=bkd.device())
+      jac = torch.zeros((self.latent_dim, self.input_dim), device=bkd.device())
+    else:
+      z = np.zeros(self.latent_dim)
+      jac = sp.csr_matrix((self.latent_dim, self.input_dim))
     for (k, ae) in self.autoencoders.items():
       ind_fom = self.indices[k]["fom"]
       ind_rom = self.indices[k]["rom"]
       x_port = x[ind_fom]
       z_port, jac_port = ae.encoder.fun_jac(x_port)
       z[ind_rom] = z_port
-      jac_block = sp.csr_matrix(jac_port)
-      if jac_block.nnz > 0:
-        rows, cols = jac_block.nonzero()
-        data = jac_block.data
-        jac_add = sp.csr_matrix((data, (ind_rom[rows], ind_fom[cols])), shape=(self.latent_dim, self.input_dim))
-        jac = jac + jac_add
+      if bkd.is_torch_backend():
+        rows = torch.as_tensor(ind_rom, device=jac.device, dtype=torch.long)
+        cols = torch.as_tensor(ind_fom, device=jac.device, dtype=torch.long)
+        jac[rows[:, None], cols[None, :]] = jac_port
+      else:
+        jac_block = sp.csr_matrix(jac_port)
+        if jac_block.nnz > 0:
+          rows, cols = jac_block.nonzero()
+          data = jac_block.data
+          jac_add = sp.csr_matrix((data, (ind_rom[rows], ind_fom[cols])), shape=(self.latent_dim, self.input_dim))
+          jac = jac + jac_add
     return z, jac
 
 
@@ -475,5 +496,3 @@ class MultiAutoencoder(Autoencoder):
     W2 = sp.csr_matrix(W2)
     # Return weights
     return {"W1": W1, "b1": b1, "W2": W2}
-
-

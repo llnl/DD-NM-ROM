@@ -6,7 +6,7 @@ from dd_nm_rom.elements import mesh as mesh_mod
 from dd_nm_rom.elements import bound_cond as bc_mod
 
 from .basic import BasicField
-from pyDOE import lhs
+from pydoe import lhs
 
 
 class MultiPeakGen(BasicField):
@@ -18,7 +18,8 @@ class MultiPeakGen(BasicField):
     mesh: mesh_mod.MeshDD,
     mu_lim: List[float] = [0.9, 1.1],
     forced_config: Union[List[int], np.ndarray, None] = None,
-    bc_type: str = "neumann"
+    bc_type: str = "neumann",
+    use_qmc: bool = True
   ) -> None:
     super(MultiPeakGen, self).__init__(mesh)
     bc_mod.check_bc_type(bc_type)
@@ -26,6 +27,7 @@ class MultiPeakGen(BasicField):
     self.mu_lim = mu_lim
     self.configs = None
     self.forced_config = forced_config
+    self.use_qmc = use_qmc
     if (self.forced_config is not None):
       self.forced_config = np.array(self.forced_config).reshape(-1)
 
@@ -43,21 +45,27 @@ class MultiPeakGen(BasicField):
         design_space[0, :] -> lower bounds
         design_space[1, :] -> upper bounds
     """
-    # Define possible combinations
-    self.configs = ops.generate_combs([np.arange(2)]*self.mesh.n_sub)[1:]
-    if (self.forced_config is not None):
-      self.configs += self.forced_config.reshape(1,-1)
-      self.configs = self.configs.astype(bool).astype(int)
-      self.configs = np.unique(self.configs, axis=0)
-    # Define design space
-    self.design_space = [[0,len(self.configs)]] + [self.mu_lim]* (2*self.mesh.n_sub)
+    if self.use_qmc:
+      self.design_space = [self.mu_lim] * (2*self.mesh.n_sub)
+    else:
+      # Define possible combinations (legacy path).
+      self.configs = ops.generate_combs([np.arange(2)]*self.mesh.n_sub)[1:]
+      if (self.forced_config is not None):
+        self.configs += self.forced_config.reshape(1,-1)
+        self.configs = self.configs.astype(bool).astype(int)
+        self.configs = np.unique(self.configs, axis=0)
+      self.design_space = [[0,len(self.configs)]] + [self.mu_lim]* (2*self.mesh.n_sub)
     self.design_space = np.array(self.design_space).T
 
-    self.design_space_u = self.design_space[:, : 1 + self.mesh.n_sub]
-    self.design_space_v = np.concatenate(
-      [self.design_space[:, [0]], self.design_space[:, 1 + self.mesh.n_sub : 1 + 2 * self.mesh.n_sub]],
-      axis=1
-    )
+    if self.use_qmc:
+      self.design_space_u = self.design_space[:, :self.mesh.n_sub]
+      self.design_space_v = self.design_space[:, self.mesh.n_sub:]
+    else:
+      self.design_space_u = self.design_space[:, : 1 + self.mesh.n_sub]
+      self.design_space_v = np.concatenate(
+        [self.design_space[:, [0]], self.design_space[:, 1 + self.mesh.n_sub : 1 + 2 * self.mesh.n_sub]],
+        axis=1
+      )
 
   def sample_design_space(self) -> np.ndarray:
     s = 0.0
@@ -100,27 +108,40 @@ class MultiPeakGen(BasicField):
         np.ndarray: A (n_samples × n_sub) array of masked amplitude vectors, where
         each row represents a sample with μ_i values only in the active subdomains.
     """
-#   dmat = super(MultiPeakGen, self).construct_design_mat(n_samples)
     self._init_design_space()
-    # Construct
+    if self.use_qmc:
+      dmat_u, mask_u = super(MultiPeakGen, self).construct_design_mat_qmc(
+        n_samples, design_space=self.design_space_u
+      )
+      dmat_v, mask_v = super(MultiPeakGen, self).construct_design_mat_qmc(
+        n_samples, design_space=self.design_space_v
+      )
+      return self._convert_dmat_to_mu(dmat_u, dmat_v, mask_u, mask_v)
+
+    # Legacy LHS path.
     ddim = self.design_space_u.shape[1]
     dmat_u = lhs(ddim, int(n_samples))
     ddim = self.design_space_v.shape[1]
     dmat_v = lhs(ddim, int(n_samples))
-    # Rescale
     amin, amax = self.design_space_u
     dmat_u = dmat_u * (amax - amin) + amin
     amin, amax = self.design_space_v
     dmat_v = dmat_v * (amax - amin) + amin
-
     return self._convert_dmat_to_mu(dmat_u, dmat_v)
-#   return self._convert_dmat_to_mu(dmat)
 
   def _convert_dmat_to_mu(
     self,
     dmat_u: np.ndarray,
-    dmat_v: np.ndarray
+    dmat_v: np.ndarray,
+    mask_u: Union[np.ndarray, None] = None,
+    mask_v: Union[np.ndarray, None] = None
   ) -> np.ndarray:
+    if self.use_qmc:
+      if (self.forced_config is not None):
+        forced = self.forced_config.reshape(1, -1)
+        mask_u = np.maximum(mask_u, forced)
+        mask_v = np.maximum(mask_v, forced)
+      return np.hstack([mask_u * dmat_u, mask_v * dmat_v])
 
     mu_u_raw = dmat_u[:, 1 : 1 + self.mesh.n_sub]
     mu_v_raw = dmat_v[:, 1 : 1 + self.mesh.n_sub]

@@ -1,6 +1,7 @@
 import pandas as pd
 
 from dd_nm_rom import postproc
+from dd_nm_rom import backend as bkd
 
 from .callback import Callback
 
@@ -19,6 +20,8 @@ class LearningRateTracker(Callback):
   def on_train_begin(self):
     self.history = {'epoch': [], 'lr': []}
     self.filename = self.model.dirs['train'] + '/lr.csv'
+    if bkd.distributed() and bkd.get_rank() != 0:
+      return
     # Create file
     df = pd.DataFrame.from_dict(self.history)
     df.to_csv(self.filename, index=False)
@@ -29,11 +32,15 @@ class LearningRateTracker(Callback):
       self.history['epoch'].append(epoch)
       lr = self.model.optimizer.param_groups[0]['lr']
       self.history['lr'].append(lr)
+      if bkd.distributed() and bkd.get_rank() != 0:
+        return
       self._write()
       if (self.verbose and (epoch % self.display_freq == 0)):
         print(' '*4 + self.header + "learning rate = %.5e" % (lr,))
 
   def on_train_end(self):
+    if bkd.distributed() and bkd.get_rank() != 0:
+      return
     self._write()
     if self.plotting:
       hist_df = pd.read_csv(self.filename)

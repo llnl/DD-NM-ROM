@@ -1,5 +1,10 @@
 import json
 import numpy as np
+import torch
+import torch.distributed as dist
+from mpi4py import MPI
+
+from dd_nm_rom import backend as bkd
 
 from .callback import Callback
 
@@ -32,6 +37,9 @@ class EarlyStopping(Callback):
 
   def on_epoch_end(self):
     current = self.get_monitor_value()
+    if bkd.distributed():
+      current = bkd._COMM.allreduce(current, op=MPI.SUM)
+      current = current / bkd.get_nranks()
     if self.monitor_op(current - self.min_delta, self.best):
       self.best = current
       self.wait = 0
@@ -73,6 +81,9 @@ class ValueEarlyStopping(EarlyStopping):
 
   def on_epoch_end(self):
     current = self.get_monitor_value()
+    if bkd.distributed():
+      current = bkd._COMM.allreduce(current, op=MPI.SUM)
+      current = current / bkd.get_nranks()
     if self.monitor_op(current, self.epsilon):
       self.stopped_epoch = self.model.train_state.epoch
       self.model.stop_training = True
@@ -90,17 +101,25 @@ class Terminator(Callback):
 
   def on_train_begin(self):
     self.filename = self.model.dirs["train"] + "/train_ctrl.json"
+    if bkd.distributed() and bkd.get_rank() != 0:
+      return
     with open(self.filename, "w") as file:
       json.dump({"stop_training": False}, file, indent=4)
 
   def on_epoch_end(self):
     epoch = self.model.train_state.epoch
     if (epoch % self.frequency == 0):
-      with open(self.filename) as file:
-        control = json.load(file)
-      if control["stop_training"]:
-        self.stopped_epoch = epoch
-        self.model.stop_training = True
+      if not bkd.distributed() or (bkd.distributed() and bkd.get_rank() == 0):
+        with open(self.filename) as file:
+          control = json.load(file)
+
+        if control["stop_training"]:
+          self.stopped_epoch = epoch
+          self.model.stop_training = True
+
+      if bkd.distributed():
+        self.stopped_epoch = bkd._COMM.bcast(self.stopped_epoch, 0)
+        self.model.stop_training = bkd._COMM.bcast(self.model.stop_training, 0)
 
   def on_train_end(self):
     if (self.stopped_epoch > 0):

@@ -1,7 +1,8 @@
 import abc
 import numpy as np
 
-from pyDOE import lhs
+from pydoe import lhs
+from scipy.stats import qmc
 from typing import Dict, Union
 from dd_nm_rom.elements import mesh as mesh_mod
 from dd_nm_rom.elements import bound_cond as bc_mod
@@ -26,12 +27,14 @@ class BasicField(object):
   def __init__(
     self,
     mesh: mesh_mod.MESH_TYPES,
+    use_qmc: bool = True,
   ) -> None:
     self.name = self.__class__.__name__
     self.mu = None
     self.mesh = mesh
     self.design_space = None
     self.bc_type = "dirichlet"
+    self.use_qmc = use_qmc
 
   # Design space
   # ===================================
@@ -73,6 +76,10 @@ class BasicField(object):
     :return: Design matrix with sampled points.
     :rtype: np.ndarray
     """
+    if self.use_qmc:
+      dmat, _ = self.construct_design_mat_qmc(n_samples)
+      return dmat
+
     self.init_design_space()
     # Construct
     ddim = self.design_space.shape[1]
@@ -80,6 +87,36 @@ class BasicField(object):
     # Rescale
     amin, amax = self.design_space
     return dmat * (amax - amin) + amin
+
+  def construct_design_mat_qmc(
+    self,
+    n_samples: int,
+    design_space: Union[np.ndarray, None] = None
+  ) -> np.ndarray:
+    """
+    Construct a design matrix using Latin Hypercube Sampling (LHS).
+
+    :param n_samples: Number of samples to generate.
+    :type n_samples: int
+
+    :return: Design matrix with sampled points.
+    :rtype: np.ndarray
+    """
+    if (design_space is None):
+      self.init_design_space()
+      design_space = self.design_space
+    else:
+      design_space = np.asarray(design_space)
+    # Construct
+    ddim = design_space.shape[1]
+    engine = qmc.LatinHypercube(d=ddim)
+    dmat = engine.random(n_samples)
+    # Get a binary mask based on the samples
+    mask = (dmat >= 0.5).astype(int)
+    # Rescale
+    dmat = qmc.scale(dmat, design_space[0,:], design_space[1,:])
+
+    return dmat, mask
 
   def construct_design_mat_test(
     self,

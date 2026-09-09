@@ -1,5 +1,8 @@
 import numpy as np
+import torch
+import torch.distributed as dist
 
+from dd_nm_rom import backend as bkd
 from .callback import Callback
 
 
@@ -18,8 +21,10 @@ class ModelCheckpoint(Callback):
     self.overwrite = overwrite
     self.best = np.inf
     self.monitor = monitor
-    self.monitor_op = np.less
+    self.monitor_op = np.less if not bkd.distributed() else torch.less
     self.epochs_since_last_save = 0
+    if bkd.distributed():
+      self.best = bkd.to_backend(self.best)
 
   def on_epoch_end(self):
     # Update epochs count
@@ -34,6 +39,9 @@ class ModelCheckpoint(Callback):
       if self.overwrite:
         filename = prefix + f"/model_best"
       current = self.get_monitor_value()
+      if bkd.distributed():
+        current = bkd.to_backend(current)
+        dist.all_reduce(current, op=dist.ReduceOp.AVG)
       if self.monitor_op(current, self.best):
         self.model.save(filename)
         self.best = current

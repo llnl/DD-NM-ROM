@@ -5,6 +5,7 @@ from typing import Dict
 
 from .neumann import NeumannBC
 from .. import mesh as mesh_mod
+from ... import backend as bkd
 
 
 class PeriodicBC(NeumannBC):

@@ -4,10 +4,13 @@ import types
 import inspect
 import joblib as jl
 import dill as pickle
+import numpy as np
 
 from tqdm import tqdm
 from typing import Any, List, Union
+from itertools import groupby
 
+from . import backend as bkd
 
 # Classes
 # =====================================
@@ -153,8 +156,31 @@ def load_case_parallel(
   :return: A list of loaded cases.
   :rtype: List[Any]
   """
+  #"""
+  single_case = False
+  if bkd.distributed():
+    ranges = np.arange(*ranges).tolist()
+    range_per_rank = len(ranges) // bkd.get_nranks()
+    if range_per_rank == 0:
+      single_case = True
+    else:
+      print(" TOTAL RANGES {} split into {} per rank!".format(len(ranges), range_per_rank))
+      rank = bkd.get_rank()
+      start = rank * range_per_rank
+      end = (rank+1) * range_per_rank
+      extra = len(ranges) % bkd.get_nranks()
+      if extra != 0 and rank == bkd.get_nranks() - 1:
+        end += extra
+      ranges = ranges[start:end]
+      print(" RANK {} loading {} ranges: {} ({})".format(rank, len(ranges), ranges, ranges))
+      bkd._COMM.Barrier()
+  else:
+    ranges = range(*ranges)
+    print(" RANK 0 loading {} ranges: {} ({})".format(len(ranges), ranges, ranges))
+  #"""
+
   iterable = tqdm(
-    iterable=range(*ranges),
+    iterable=ranges,
     ncols=80,
     desc="> Cases",
     file=sys.stdout
@@ -164,7 +190,16 @@ def load_case_parallel(
       jl.delayed(load_case)(path=path, index=i, key=key) for i in iterable
     )
   else:
-    return [load_case(path=path, index=i, key=key) for i in iterable]
+    cases = None
+    if not bkd.distributed() or not single_case or (single_case and bkd.root()):
+        cases = [load_case(path=path, index=i, key=key) for i in iterable]
+    if single_case:
+        cases = bkd._COMM.bcast(cases, 0)
+
+    if bkd.distributed():
+        bkd._COMM.Barrier()
+    return cases
+
 
 def generate_case_parallel(
   sol_fun: callable,
@@ -205,12 +240,6 @@ def generate_case_parallel(
   """
   iterable_indices = list(range(n_samples)) if indices is None else list(indices)
   iterable = tqdm(iterable=iterable_indices, ncols=80, desc=desc, file=sys.stdout)
-# iterable = tqdm(
-#   iterable=range(n_samples),
-#   ncols=80,
-#   desc=desc,
-#   file=sys.stdout
-# )
   if (n_workers > 1):
     converged = jl.Parallel(n_workers)(
       jl.delayed(sol_fun)(i) for i in iterable
@@ -218,5 +247,50 @@ def generate_case_parallel(
   else:
     converged = [sol_fun(i) for i in iterable]
   if verbose:
-#   print(f"> Total converged cases: {sum(converged)}/{n_samples}")
     print(f"> Total converged cases: {sum(converged)}/{len(iterable_indices)}")
+
+
+def parallel_print(str):
+  """
+  Prints str in order on each rank
+  NOTE: assumes all ranks will call this
+  """
+  if not bkd.distributed():
+    print(str)
+    return
+
+  for rank in range(bkd.get_nranks()):
+    if (rank == bkd.get_rank()):
+      print(str)
+    bkd.barrier()
+  bkd.barrier()
+
+
+def compress_ranges(numbers: Union[List[int], np.array]):
+    """
+    Helper function to take a range of numbers [0, 1, 2, 3, ..., 10] and return
+    a shortened text representation: "0-10"
+    """
+    parts = []
+    for _, group in groupby(enumerate(numbers), key=lambda t: t[1] - t[0]):
+        group = list(group)
+        start = group[0][1]
+        end = group[-1][1]
+        parts.append(f"{start}-{end}" if start != end else str(start))
+
+    return ",".join(parts)
+
+
+def is_in_range(ranges: str, n: int):
+    """
+    Helper function to check if a given number is in a compressed representation of a range.
+    Ex: ranges: [0-10, 20-30], check if n=5 is in the range
+    """
+    for part in ranges.split(","):
+        if "-" in part:
+            start, end = map(int, part.split("-"))
+            if start <= n <= end:
+                return True
+        elif int(part) == n:
+            return True
+    return False

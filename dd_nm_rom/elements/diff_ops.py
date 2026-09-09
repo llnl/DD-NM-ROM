@@ -1,10 +1,12 @@
 import numpy as np
 import scipy.sparse as sp
+import torch
 
 from typing import List
 
 from . import mesh as mesh_mod
 from . import bound_cond as bc_mod
+from .. import backend as bkd
 
 
 class DiffOperators(object):
@@ -57,7 +59,6 @@ class DiffOperators(object):
 
     if self.upwind:
       if self.upwind_order == 1:
-          print('using first order')
           return self.build_upwind_1st()
       else:
           return self.build_upwind_2nd_gen()
@@ -70,6 +71,7 @@ class DiffOperators(object):
       Di = self._build_op(axis, stencil=[ 1, -2, 1], diags=[-1, 0, 1])
       self.ops[f"A{axis}"] = (-0.5/h) * Ai
       self.ops["D"] = self.ops["D"] + (self.nu/h**2) * Di
+    self.ops = self._ops_to_backend()
     self.built = True
 
   def _build_op(
@@ -107,6 +109,17 @@ class DiffOperators(object):
       op = sp.kron(op, sp.eye(n["x"]))
     return op.tocsr()
 
+
+  def _ops_to_backend(self):
+    if bkd.is_torch_backend():
+        for op in self.ops:
+            if sp.issparse(self.ops[op]):
+                self.ops[op] = bkd.to_sp_backend(self.ops[op])
+            else:
+                self.ops[op] = bkd.to_backend(self.ops[op])
+    return self.ops
+
+
   def build_upwind_1st(self) -> None:
     """
     Build differential operators using first-order upwind scheme,
@@ -129,6 +142,7 @@ class DiffOperators(object):
         Di = self._build_op(axis, stencil=[1, -2, 1], diags=[-1, 0, 1])
         self.ops["D"] = self.ops["D"] + (self.nu/h**2) * Di
 
+    self.ops = self._ops_to_backend()
     self.built = True
 
 
@@ -149,6 +163,7 @@ class DiffOperators(object):
           # Standard second-order central for diffusion
           Di = self._build_op(axis, stencil=[1, -2, 1], diags=[-1, 0, 1])
           self.ops["D"] = self.ops["D"] + (self.nu/h**2) * Di
+      self.ops = self._ops_to_backend()
       self.built = True
 
   def _build_extended_op(
@@ -231,6 +246,8 @@ class DiffOperators(object):
           # Standard second-order central for diffusion
           Di = self._build_op(axis, stencil=[1, -2, 1], diags=[-1, 0, 1])
           self.ops["D"] = self.ops["D"] + (self.nu/h**2) * Di
+
+      self.ops = self._ops_to_backend()
       self.built = True
 
   def _build_extended_op_gen(

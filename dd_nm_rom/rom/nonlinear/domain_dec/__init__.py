@@ -3,4 +3,4 @@ __all__ = [
 ]
 
 from .model import DD_NM_ROM
-from .utils import load_nn_configfiles
+from .utils import *

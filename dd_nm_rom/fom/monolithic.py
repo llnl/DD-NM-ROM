@@ -1,6 +1,6 @@
 import numpy as np
 import scipy.sparse as sp
-
+import torch
 
 from time import time
 from dd_nm_rom import ops, solvers
@@ -8,6 +8,7 @@ from dd_nm_rom import field as field_mod
 from typing import Dict, List, Tuple, Union
 
 from dd_nm_rom import field as field_mod
+from dd_nm_rom import backend as bkd
 from dd_nm_rom.elements import DiffOperators
 from dd_nm_rom.elements import mesh as mesh_mod
 from dd_nm_rom.elements import bound_cond as bc_mod
@@ -79,7 +80,13 @@ class Burgers2D(object):
     # Identities
     self.iden = sp.eye(self.mesh.nxy).tocsr()
     self.iden_uv = sp.eye(self.get_ndof()).tocsr()
+    self.iden = bkd.to_sp_backend(self.iden)
+    self.iden_uv = bkd.to_sp_backend(self.iden_uv)
+    if bkd.is_torch_backend():
+      self.iden = self.iden.to_sparse_coo()
+      self.iden_uv = self.iden_uv.to_sparse_coo()
     self.built = True
+
 
   def build_bc(
     self,
@@ -116,8 +123,13 @@ class Burgers2D(object):
     # Backward Euler for integration
     if (not self.steady):
       res = x - self.x_old - self.dt*res
-      jac = self.iden_uv - self.dt*jac
+      if bkd.is_torch_backend():
+        #jac = self.iden_uv.to_dense() - self.dt*jac.to_sparse_coo()
+        jac = self.iden_uv - self.dt*jac.to_sparse_coo()
+      else:
+        jac = self.iden_uv - self.dt*jac
     delta = time()-start
+    jac = bkd.to_sp_backend(jac)
     self.runtime["total"] += delta
     self.runtime["res_jac"] += delta
     return res, jac
@@ -133,16 +145,24 @@ class Burgers2D(object):
     for axis in ("x", "y"):
       adv_act[axis] = {}
       for k in ("u", "v"):
-        adv_act[axis][k] = self.ops[f"A{axis}"] @ uv[k] \
+        if bkd.is_torch_backend():
+          bc = bkd.to_backend(self.bc_f[k]["A"][axis])
+          adv_act[axis][k] = self.ops[f"A{axis}"] @ uv[k] - bc
+          del bc
+        else:
+          adv_act[axis][k] = self.ops[f"A{axis}"] @ uv[k] \
                          - self.bc_f[k]["A"][axis]
     # Compute residual
     dx = []
     for k in ("u", "v"):
+      bc = bkd.to_backend(self.bc_f[k]["D"]) if bkd.is_torch_backend() else self.bc_f[k]["D"]
       dx_k = uv_diag["u"] @ adv_act["x"][k] \
            + uv_diag["v"] @ adv_act["y"][k] \
-           + self.ops["D"] @ uv[k] + self.bc_f[k]["D"]
+           + self.ops["D"] @ uv[k] + bc
       dx.append(dx_k)
-    res = np.concatenate(dx)
+      if bkd.is_torch_backend():
+        del bc
+    res = torch.cat(dx) if bkd.is_torch_backend() else np.concatenate(dx)
     # Compute Jacobian
     jac_xx = uv_diag["u"] @ self.ops["Ax"] \
            + uv_diag["v"] @ self.ops["Ay"] \
@@ -151,11 +171,12 @@ class Burgers2D(object):
     jac_uv = ops.sp_diag(adv_act["y"]["u"])
     jac_vu = ops.sp_diag(adv_act["x"]["v"])
     jac_vv = ops.sp_diag(adv_act["y"]["v"]) + jac_xx
-    jac = sp.bmat(
-      [[jac_uu, jac_uv],
-       [jac_vu, jac_vv]],
-      format="csr"
-    )
+    jac = [[jac_uu, jac_uv],
+           [jac_vu, jac_vv]]
+    if bkd.is_torch_backend():
+        jac = bkd.torch_bmat(jac)
+    else:
+        jac = sp.bmat(jac, format="csr")
     return res, jac
 
   def extract_uv(
@@ -192,7 +213,13 @@ class Burgers2D(object):
     # Initialize solution
     start = time()
     if (x0 is None):
-      x0 = np.zeros(self.get_ndof())
+      if bkd.is_torch_backend():
+        x0 = torch.zeros(self.get_ndof(), device=bkd.device())
+      else:
+        x0 = np.zeros(self.get_ndof())
+    else:
+      if bkd.is_torch_backend():
+        x0 = bkd.to_backend(x0)
     self.runtime["total"] += time()-start
     # Initialize solver
     solver = solvers.Newton(
@@ -210,6 +237,8 @@ class Burgers2D(object):
     x, res, *_, flag = solver(x0, dt, nt)
     # Return solution
     uv = self.extract_uv(x, diag=False)
+    if not isinstance(flag, List):
+      flag = [flag]
     converged = True if (flag[-1] == 0) else False
     return uv, res, converged
 
@@ -219,6 +248,8 @@ class Burgers2D(object):
   ) -> RES_JAC_TYPE:
     """Compute residual and jacobian for the compact upwind scheme
     """
+    all_func = torch.all if bkd.is_torch_backend() else np.all
+
     # Extract u and v
     uv, uv_diag = self.extract_uv(x, diag=True)
     # Action of advection operator on vectors
@@ -238,44 +269,65 @@ class Burgers2D(object):
         pos_result = self.ops[f"A{axis}_pos"] @ uv[k]
         neg_result = self.ops[f"A{axis}_neg"] @ uv[k]
 
-        if np.all(pos_mask):
+        if all_func(pos_mask):
             result = pos_result
-        elif np.all(neg_mask):
+        elif all_func(neg_mask):
             result = neg_result
         else:
-            result = np.zeros_like(pos_result)
+            result = torch.zeros_like(pos_result) if bkd.is_torch_backend() else np.zeros_like(pos_result)
             result[pos_mask] = pos_result[pos_mask]
             result[neg_mask] = neg_result[neg_mask]
 
         # Apply boundary condition adjustments
-        adv_act[axis][k] = result - self.bc_f[k]["A"][axis]
+        if bkd.is_torch_backend():
+            bc = bkd.to_backend(self.bc_f[k]["A"][axis])
+            adv_act[axis][k] = result - bc
+            del bc
+        else:
+            adv_act[axis][k] = result - self.bc_f[k]["A"][axis]
 
     # Compute residual
     dx = []
     for k in ("u", "v"):
+      bc = bkd.to_backend(self.bc_f[k]["D"]) if bkd.is_torch_backend() else self.bc_f[k]["D"]
       dx_k = uv_diag["u"] @ adv_act["x"][k] \
            + uv_diag["v"] @ adv_act["y"][k] \
-           + self.ops["D"] @ uv[k] + self.bc_f[k]["D"]
+           + self.ops["D"] @ uv[k] + bc
       dx.append(dx_k)
-    res = np.concatenate(dx)
+      if bkd.is_torch_backend():
+        del bc
+    res = torch.cat(dx) if bkd.is_torch_backend() else np.concatenate(dx)
 
     # Compute Jacobian with direction-dependent operators
     jac_operators = {}
     for axis in ("x", "y"):
       vel_component = "u" if axis == "x" else "v"
       vel = uv[vel_component]
-      pos_mask = (vel >= 0).astype(float)
-      neg_mask = 1-pos_mask #(vel < 0)
-
       # Diagonal selection matrices
-      P = sp.diags(pos_mask)  # shape (n, n)
-      N = sp.diags(neg_mask)  # shape (n, n)
+      if bkd.is_torch_backend():
+        pos_mask = vel.ge(0.0).to(dtype=vel.dtype)
+        neg_mask = vel.lt(0.0).to(dtype=vel.dtype)
+      else:
+        pos_mask = (vel >= 0).astype(float)
+        neg_mask = 1.0 - pos_mask
+
+        # Diagonal selection matrices
+        P = sp.diags(pos_mask)  # shape (n, n)
+        N = sp.diags(neg_mask)  # shape (n, n)
 
       A_pos = self.ops[f"A{axis}_pos"]
       A_neg = self.ops[f"A{axis}_neg"]
 
       # Efficient blending
-      A_blend = P @ A_pos + N @ A_neg
+      if bkd.is_torch_backend():
+        A_pos = A_pos.to_dense() if A_pos.layout != torch.strided else A_pos
+        A_neg = A_neg.to_dense() if A_neg.layout != torch.strided else A_neg
+        A_blend = (
+          pos_mask.unsqueeze(1) * A_pos
+          + neg_mask.unsqueeze(1) * A_neg
+        )
+      else:
+        A_blend = P @ A_pos + N @ A_neg
 
       jac_operators[f"A{axis}"] = A_blend
 
@@ -289,10 +341,11 @@ class Burgers2D(object):
     jac_vu = ops.sp_diag(adv_act["x"]["v"])
     jac_vv = ops.sp_diag(adv_act["y"]["v"]) + jac_xx
     jac = sp.bmat(
-      [[jac_uu, jac_uv],
-       [jac_vu, jac_vv]],
-      format="csr"
+       [[bkd.torch_csr_to_scipy(jac_uu), bkd.torch_csr_to_scipy(jac_uv)],
+        [bkd.torch_csr_to_scipy(jac_vu), bkd.torch_csr_to_scipy(jac_vv)]],
+       format="csr"
     )
+    jac = bkd.to_sp_backend(jac)
     return res, jac
 
 class Poisson2D(object):

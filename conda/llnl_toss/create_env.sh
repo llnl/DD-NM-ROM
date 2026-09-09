@@ -13,7 +13,7 @@ anaconda_dir=/collab/usr/gapps/python/${SYS_TYPE}/anaconda3-2024.02
 
 # Inputs for virtualenv (tuolumne)
 venv_file=requirements.txt
-venv_name=ddnmrom_venv
+venv_name=ddnmrom_venv_rocm643
 virtualenv_dir=/p/lustre5/${USER}/${venv_name}/
 
 # check for machine type: toss_4_x86_64_ib = dane
@@ -36,7 +36,8 @@ else
     # Tuolumne
     if [ ! -d ${virtualenv_dir} ]; then
         # Create virtualenv
-        module load python/3.11.5 rocm/6.3.1
+        module load cray-python/3.11.5 rocm/6.4.3
+        module load rccl
 
         python3 -m venv ${virtualenv_dir}
 
@@ -59,7 +60,7 @@ else
         export NVCC_FLAGS="-UHIP_ENABLE_WARP_SYNC_BUILTINS -U__HIP_NO_HALF_OPERATORS__ -U__HIP_NO_HALF_CONVERSIONS__ -DHIP_HAS_FP16=1"
 
         # load same gcc module that was used to build torch package
-        module load gcc/11.2.1-magic
+        module load gcc/13.3.1-magic
 
         CC=mpicc CXX=mpicxx NVCC_FLAGS=$NVCC_FLAGS python -m pip install --verbose --no-build-isolation -e git+https://github.com/rusty1s/pytorch_sparse.git@master#egg=torch-sparse
         CC=mpicc CXX=mpicxx NVCC_FLAGS=$NVCC_FLAGS python -m pip install --verbose --no-build-isolation -e git+https://github.com/rusty1s/pytorch_scatter.git@master#egg=torch-scatter

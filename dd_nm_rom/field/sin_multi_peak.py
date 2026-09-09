@@ -4,6 +4,7 @@ from typing import List, Union
 from dd_nm_rom import ops
 from dd_nm_rom.elements import mesh as mesh_mod
 from dd_nm_rom.elements import bound_cond as bc_mod
+import dd_nm_rom.backend as bkd
 
 from .basic import BasicField
 
@@ -17,7 +18,8 @@ class SinMultiPeak(BasicField):
     mesh: mesh_mod.MeshDD,
     mu_lim: List[float] = [0.9, 1.1],
     forced_config: Union[List[int], np.ndarray, None] = None,
-    bc_type: str = "neumann"
+    bc_type: str = "neumann",
+    use_qmc: bool = True
   ) -> None:
     super(SinMultiPeak, self).__init__(mesh)
     bc_mod.check_bc_type(bc_type)
@@ -25,6 +27,7 @@ class SinMultiPeak(BasicField):
     self.mu_lim = mu_lim
     self.configs = None
     self.forced_config = forced_config
+    self.use_qmc = use_qmc
     if (self.forced_config is not None):
       self.forced_config = np.array(self.forced_config).reshape(-1)
 
@@ -43,14 +46,26 @@ class SinMultiPeak(BasicField):
         design_space[1, :] -> upper bounds
     """
     # Define possible combinations
-    self.configs = ops.generate_combs([np.arange(2)]*self.mesh.n_sub)[1:]
-    if (self.forced_config is not None):
-      self.configs += self.forced_config.reshape(1,-1)
-      self.configs = self.configs.astype(bool).astype(int)
-      self.configs = np.unique(self.configs, axis=0)
-    # Define design space
-    self.design_space = [[0,len(self.configs)]] + [self.mu_lim]*self.mesh.n_sub
-    self.design_space = np.array(self.design_space).T
+
+    if self.use_qmc:
+      self.design_space = [self.mu_lim]*self.mesh.n_sub
+      self.design_space = np.array(self.design_space).T
+
+    else:
+      self.configs = ops.generate_combs([np.arange(2)]*self.mesh.n_sub)[1:]
+
+
+      if (self.forced_config is not None):
+        self.configs += self.forced_config.reshape(1,-1)
+        self.configs = self.configs.astype(bool).astype(int)
+        self.configs = np.unique(self.configs, axis=0)
+      # Define design space
+      self.design_space = [[0,len(self.configs)]] + [self.mu_lim]*self.mesh.n_sub
+      self.design_space = np.array(self.design_space).T
+      if bkd.distributed():
+        self.configs = bkd._COMM.bcast(self.configs)
+    if bkd.distributed():
+      self.design_space = bkd._COMM.bcast(self.design_space)
 
   def sample_design_space(self) -> np.ndarray:
     s = 0.0
@@ -61,6 +76,8 @@ class SinMultiPeak(BasicField):
         config = config.astype(bool).astype(int)
       s = np.sum(config)
     mu = config * np.random.uniform(*self.mu_lim, size=self.mesh.n_sub)
+    if bkd.distributed():
+      mu = bkd._COMM.bcast(mu)
     return mu
 
   def construct_design_mat(
@@ -88,15 +105,31 @@ class SinMultiPeak(BasicField):
         np.ndarray: A (n_samples × n_sub) array of masked amplitude vectors, where
         each row represents a sample with μ_i values only in the active subdomains.
     """
-    dmat = super(SinMultiPeak, self).construct_design_mat(n_samples)
-    return self._convert_dmat_to_mu(dmat)
+    mask = None
+    if self.use_qmc:
+      dmat, mask = super(SinMultiPeak, self).construct_design_mat_qmc(n_samples)
+      if bkd.distributed():
+        dmat = bkd.bcast(dmat)
+        mask = bkd.bcast(mask)
+    else:
+      dmat = super(SinMultiPeak, self).construct_design_mat(n_samples)
+      if bkd.distributed():
+        dmat = bkd.bcast(dmat)
+    return self._convert_dmat_to_mu(dmat, mask)
 
   def _convert_dmat_to_mu(
     self,
-    dmat: np.ndarray
+    dmat: np.ndarray,
+    mask: np.ndarray = None
   ) -> np.ndarray:
-    cfg = np.floor(dmat[:,0]).astype(np.int32)
-    return self.configs[cfg] * dmat[:,1:]
+    if self.use_qmc:
+      if (self.forced_config is not None):
+        forced = self.forced_config.reshape(1, -1)
+        mask = np.maximum(mask, np.tile(forced, (mask.shape[0], 1)))
+      return mask * dmat
+    else:
+      cfg = np.floor(dmat[:,0]).astype(np.int32)
+      return self.configs[cfg] * dmat[:,1:]
 
   def set_params(
     self,

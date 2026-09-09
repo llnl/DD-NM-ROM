@@ -6,6 +6,7 @@ import os
 import sys
 import json
 import argparse
+import torch
 
 # Inputs
 # =====================================
@@ -38,13 +39,18 @@ from dd_nm_rom import utils
 from dd_nm_rom import fom as fom_mod
 from dd_nm_rom import field as field_mod
 from dd_nm_rom.elements import mesh as mesh_mod
+from dd_nm_rom import backend as bkd
+
 
 # Initialization
 # =====================================
 print("\nInitialization ...")
+
 # Mesh
 mesh = utils.get_class(modules=[mesh_mod], **inputs["mesh"])
 mesh.build()
+
+fom_subs_per_rank = (mesh.n_sub) // bkd.get_nranks()
 # Field
 field = utils.get_class(
   modules=[field_mod],
@@ -59,7 +65,7 @@ fom = utils.get_class(
 dd_fom = utils.get_class(
   modules=[fom_mod],
   name="DDBurgers2D"
-)(monolithic=fom, **inputs["dd_fom"]["kwargs"])
+)(monolithic=fom, subs_per_rank=fom_subs_per_rank, **inputs["dd_fom"]["kwargs"])
 # Construct design matrices
 n_samples = inputs["data_gen"]["n_samples"]
 mu = {"train": [], "test": []}
@@ -92,12 +98,17 @@ def make_compute_sol(dset="train"):
     if (dset == "train"):
       # > Use FOM
       x0 = field.get_init()
-      uv, *_, converged = fom.solve(x0, **inputs["solver"])
+      uv, *_, converged = fom.solve(bkd.to_backend(x0), **inputs["solver"])
+      uv = bkd.to_numpy(uv)
     else:
       # > Use DD-FOM
       dd_fom.build()
       x0 = dd_fom.get_init_sol(x=field.get_init())
       uv, *_, converged = dd_fom.solve(x0, **inputs["solver"])
+
+    if bkd.is_torch_backend():
+        uv["u"] = uv["u"].cpu()
+        uv["v"] = uv["v"].cpu()
     # Save solution
     if converged:
       case_i = {
@@ -110,13 +121,13 @@ def make_compute_sol(dset="train"):
       if (dset == "train"):
         # > Store FOM-related data
         case_i.update({
-          "snapshots": np.vstack([uv["u"], uv["v"]]).T,
+          "snapshots": torch.vstack([uv["u"], uv["v"]]).T if bkd.is_torch_backend() else np.vstack([uv["u"], uv["v"]]).T,
           "runtime": fom.runtime
         })
       else:
         # > Store DD-FOM-related data
         case_i.update({
-          "snapshots": np.vstack([uv["res"]["u"], uv["res"]["v"]]).T,
+          "snapshots": torch.vstack([uv["res"]["u"], uv["res"]["v"]]).T if bkd.is_torch_backend() else np.vstack([uv["res"]["u"], uv["res"]["v"]]).T,
           "solution": uv,
           "runtime": dd_fom.runtime
         })

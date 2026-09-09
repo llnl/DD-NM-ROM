@@ -234,7 +234,9 @@ class Autoencoder(torch.nn.Module):
     if loading:
       saved_model = os.path.abspath(saved_model)
       print(f"Restoring network from file '{saved_model}'")
-      self.load_state_dict(torch.load(saved_model))
+      model_checkpoint = torch.load(saved_model, weights_only=False)
+      torch.nn.modules.utils.consume_prefix_in_state_dict_if_present(model_checkpoint, "module.")
+      self.load_state_dict(model_checkpoint)
     # To float/device
     self.to(dtype=bkd.floatx("torch"), device=bkd.device())
 
@@ -248,6 +250,9 @@ class Autoencoder(torch.nn.Module):
     return x
 
   def summary(self, filename=None, verbose=2):
+    if bkd.distributed() and bkd.get_rank() != 0:
+      # only print summary on root rank
+      return
     stats = torchinfo.summary(
       model=self,
       input_size=(self.input_dim,),

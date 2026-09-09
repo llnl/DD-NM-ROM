@@ -1,11 +1,12 @@
 import numpy as np
 
 from . import dtypes
+from ... import backend as bkd
 
 
 class DDIndices(object):
   """
-  Class for generating residual, interior, and interface subdomain 
+  Class for generating residual, interior, and interface subdomain
   indices for a steady-state 2D Burgers FOM.
   """
 
@@ -57,6 +58,7 @@ class DDIndices(object):
       # For each row (i.e., node in the grid),
       # finds nonzero columns (due to FD stencil)
       for op in self.ops:
+        op = bkd.torch_csr_to_scipy(op)
         cols = op[res_s].nonzero()[1]
         cols = np.unique(cols).tolist()
         all_s = all_s.union(set(cols))
@@ -167,7 +169,7 @@ class DDIndices(object):
     nodes: np.ndarray
   ) -> np.ndarray:
     nodes = np.sort(nodes)
-    if ((len(nodes) > 1) and np.in1d(nodes, self.skeleton_bound).all()):
+    if ((len(nodes) > 1) and np.isin(nodes, self.skeleton_bound).all()):
       if (orient == "vert"):
         shape, axis = (-1,2), 1
       else:

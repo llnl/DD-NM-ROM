@@ -1,6 +1,7 @@
 import pandas as pd
 
 from dd_nm_rom import postproc
+from dd_nm_rom import backend as bkd
 
 from .callback import Callback
 
@@ -23,6 +24,8 @@ class History(Callback):
     self.frequency = frequency
 
   def on_train_begin(self):
+    if bkd.distributed() and bkd.get_rank() != 0:
+      return
     self.filename = self.model.dirs['train'] + '/history.csv'
     self.history = {'epoch': []}
     self.history.update({
@@ -33,6 +36,8 @@ class History(Callback):
     df.to_csv(self.filename, index=False)
 
   def on_epoch_end(self):
+    if bkd.distributed() and bkd.get_rank() != 0:
+      return
     epoch = self.model.train_state.epoch
     self.history['epoch'].append(epoch)
     for (k, v) in self.model.train_state.logs.items():
@@ -41,6 +46,8 @@ class History(Callback):
       self._write()
 
   def on_train_end(self):
+    if bkd.distributed() and bkd.get_rank() != 0:
+      return
     self._write()
     if self.plotting:
       postproc.plot_loss(

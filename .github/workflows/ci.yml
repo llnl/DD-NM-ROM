@@ -1,0 +1,157 @@
+name: DD-NM-ROM CI
+
+on:
+  push:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: read
+
+env:
+  VENV_PATH: .venv
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  setup-environment:
+    name: Set up test environment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Setup MPI
+        uses: mpi4py/setup-mpi@v1
+        with:
+          mpi: 'openmpi'
+
+      - name: Restore virtualenv
+        id: virtualenv-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VENV_PATH }}
+          key: ${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-venv-${{ hashFiles('.github/requirements.txt') }}
+
+      - name: Create and install virtualenv
+        if: steps.virtualenv-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m pip install --upgrade pip virtualenv
+          python -m virtualenv "${VENV_PATH}"
+          "${VENV_PATH}/bin/python" -m pip install --upgrade pip
+          "${VENV_PATH}/bin/python" -m pip install -r .github/requirements.txt
+          INSTALL_ROOT="${VENV_PATH}/src" \
+          PYTHON_BIN="${VENV_PATH}/bin/python" \
+            bash conda/llnl_toss/install_sparselinear.sh
+          "${VENV_PATH}/bin/python" -m pip install --no-deps --editable .
+
+  unit-tests:
+    name: Unit tests (${{ matrix.backend }})
+    needs: setup-environment
+    runs-on: ubuntu-latest
+    env:
+      DDNMROM_VERBOSE: "1"
+      DDNMROM_LOG_LEVEL: "20"
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          - numpy
+          - torch_cpu
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Restore virtualenv
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VENV_PATH }}
+          key: ${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-venv-${{ hashFiles('.github/requirements.txt') }}
+
+      - name: Run unit tests
+        run: |
+          "${VENV_PATH}/bin/python" -m pytest tests \
+            -vv -s --log-cli-level=INFO \
+            --backend="${{ matrix.backend }}" \
+            -m "not packaging"
+
+  parallel-tests:
+    name: Parallel tests (ranks=${{ matrix.ranks }})
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    env:
+      DDNMROM_VERBOSE: "1"
+      DDNMROM_LOG_LEVEL: "20"
+    strategy:
+      fail-fast: false
+      matrix:
+        ranks:
+          - 2
+          - 4
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Setup MPI
+        uses: mpi4py/setup-mpi@v1
+        with:
+          mpi: 'openmpi'
+
+      - name: Restore virtualenv
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VENV_PATH }}
+          key: ${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-venv-${{ hashFiles('.github/requirements.txt') }}
+
+      - name: Run parallel tests
+        run: |
+          mpiexec -n "${{ matrix.ranks }}" \
+            "${VENV_PATH}/bin/python" -m pytest tests \
+            -vv -s --log-cli-level=INFO \
+            --with-mpi \
+            --backend=torch_cpu \
+            -m "not packaging"
+
+  packaging-tests:
+    name: Packaging tests
+    needs:
+      - unit-tests
+      - parallel-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Restore virtualenv
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VENV_PATH }}
+          key: ${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-venv-${{ hashFiles('.github/requirements.txt') }}
+
+      - name: Run packaging tests
+        run: |
+          "${VENV_PATH}/bin/python" -m pytest tests \
+            -vv -s --log-cli-level=INFO \
+            -m packaging \
+            --backend=torch_cpu

@@ -1,4 +1,6 @@
 import pytest
+import torch
+from mpi4py import MPI
 from pathlib import Path
 import sys
 
@@ -16,6 +18,27 @@ Default fixture used for all tests is torch-cpu
 
 _BACKENDS = ["numpy", "torch_cpu", "torch_gpu"]
 _DEFAULT_BACKEND = "torch_cpu"
+
+
+def _initialize_torch_backend(bkd, device):
+  """Configure Torch and initialize MPI once for MPI-launched tests."""
+  bkd.set_backend("torch")
+  bkd.set_device(device)
+  bkd.set_floatx("float64")
+  if MPI.COMM_WORLD.Get_size() > 1 and bkd._NRANKS is None:
+    if device == "cpu":
+      get_name = torch.cuda.get_device_name
+      get_properties = torch.cuda.get_device_properties
+      torch.cuda.get_device_name = lambda *args, **kwargs: "cpu"
+      torch.cuda.get_device_properties = lambda *args, **kwargs: "cpu"
+      try:
+        bkd.init_distributed(device)
+      finally:
+        torch.cuda.get_device_name = get_name
+        torch.cuda.get_device_properties = get_properties
+    else:
+      bkd.init_distributed(device)
+  bkd.set_seed(0)
 
 
 def pytest_addoption(parser):
@@ -41,9 +64,7 @@ def backend_numpy():
 def backend_torch_cpu():
   # Set numpy as backend
   from dd_nm_rom import backend as bkd
-  bkd.set_backend("torch")
-  bkd.set_device("cpu")
-  bkd.set_floatx("float64")
+  _initialize_torch_backend(bkd, "cpu")
 
   yield
 
@@ -54,9 +75,7 @@ def backend_torch_cpu():
 def backend_torch_gpu():
   # Set numpy as backend
   from dd_nm_rom import backend as bkd
-  bkd.set_backend("torch")
-  bkd.set_device("cuda")
-  bkd.set_floatx("float64")
+  _initialize_torch_backend(bkd, "cuda")
 
   yield
 

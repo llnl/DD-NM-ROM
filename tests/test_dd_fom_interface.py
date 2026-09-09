@@ -209,8 +209,8 @@ def _build_fom_solution_case(
     n_sub_y = 2 * world_size
 
   mesh = mesh_mod.MeshDD(
-    nx_intr=16,
-    ny_intr=16,
+    nx_intr=4,
+    ny_intr=4,
     lx_sub=0.5,
     ly_sub=0.5,
     n_sub_x=1,

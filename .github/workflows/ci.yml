@@ -45,6 +45,9 @@ jobs:
           python -m pip install --upgrade pip virtualenv
           python -m virtualenv "${VENV_PATH}"
           "${VENV_PATH}/bin/python" -m pip install --upgrade pip
+          "${VENV_PATH}/bin/python" -m pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            "torch==2.13.0"
           "${VENV_PATH}/bin/python" -m pip install -r .github/requirements.txt
           INSTALL_ROOT="${VENV_PATH}/src" \
           PYTHON_BIN="${VENV_PATH}/bin/python" \
@@ -131,7 +134,7 @@ jobs:
             -vv -s --log-cli-level=INFO \
             --with-mpi \
             --backend=torch_cpu \
-            -m "not packaging"
+            -m mpi
 
   packaging-tests:
     name: Packaging tests

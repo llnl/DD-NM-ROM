@@ -1120,6 +1120,15 @@ def get_local_shape(
   return rank_sizes
 
 
+def _ensure_contiguous(
+  x: Union[torch.Tensor, List[torch.Tensor]],
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+  """Return tensor inputs with contiguous storage when required by MPI."""
+  if isinstance(x, list):
+    return [value if value.is_contiguous() else value.contiguous() for value in x]
+  return x if x.is_contiguous() else x.contiguous()
+
+
 def gather_tensor(
   x: torch.Tensor,
   sizes: Optional[List[int]] = None,
@@ -1158,6 +1167,7 @@ def gather_tensor(
     x_sparse = True
     assert x.layout == torch.sparse_csr
     x = x.to_dense()
+  x = _ensure_contiguous(x)
 
   data = None
 
@@ -1328,9 +1338,12 @@ def gatherv_tensor(
 
   #assert x.storage_offset() == 0
 
-  # NOTE: bus error without cpu below: (5/15)
-  #_COMM.Gatherv([x.cpu(), x.numel(), dtype], [data, rank_sizes, rank_offsets, dtype], root)
-  _COMM.Gatherv(x.cpu(), [data, rank_sizes, rank_offsets, dtype], root)
+  # mpi4py requires a contiguous host buffer.  State vectors assembled by the
+  # DD-FOM are frequently tensor views, and passing those views directly can
+  # trigger DLPack ``buffer is not contiguous`` errors.
+  send_buffer = _ensure_contiguous(x).detach().cpu().numpy()
+  recv_buffer = data.numpy() if _RANK == root else None
+  _COMM.Gatherv(send_buffer, [recv_buffer, rank_sizes, rank_offsets, dtype], root)
 
   #data = comm.gather(x, dim=dim, out=data)
   #tmp = comm.gather(x, dim=dim)
@@ -1513,7 +1526,8 @@ def scatter_tensor(
   data = None
   if _RANK == root:
     if not as_list:
-      data = list(torch.tensor_split(x, _NRANKS, dim=dim))
+      x = _ensure_contiguous(x)
+      data = _ensure_contiguous(list(torch.tensor_split(x, _NRANKS, dim=dim)))
       full_size = x.shape[dim]
       assert len(data) == _NRANKS
       if x_out is None:
@@ -1521,6 +1535,7 @@ def scatter_tensor(
         full_size[dim] = x.shape[dim] // _NRANKS
     else:
       assert len(x) == _NRANKS
+      x = _ensure_contiguous(x)
       full_size = x[0].shape[dim]
 
   if x_out is None:
@@ -1533,6 +1548,7 @@ def scatter_tensor(
         x_out.append(torch.empty(full_size, device=device()))
 
   barrier()
+  x_out = _ensure_contiguous(x_out)
   if not as_list:
     dist.scatter(x_out, data, root)
   else:
@@ -1600,9 +1616,14 @@ def broadcast_tensor(
   out_size = _COMM.bcast(out_size, root=root)
   dtype = _COMM.bcast(dtype, root=root)
 
-  if _RANK != root and x_out is None:
-    # create output space on all other ranks
-    x = torch.zeros(out_size, dtype=dtype, device=device())
+  if _RANK != root:
+    if x_out is None:
+      # create output space on all other ranks
+      x = torch.zeros(out_size, dtype=dtype, device=device())
+    else:
+      x = x_out
+
+  x = _ensure_contiguous(x)
 
   dist.broadcast(x, src=root)
 

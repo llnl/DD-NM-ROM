@@ -73,6 +73,11 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      - name: Setup MPI
+        uses: mpi4py/setup-mpi@v1
+        with:
+          mpi: 'openmpi'
+
       - name: Restore virtualenv
         uses: actions/cache@v4
         with:

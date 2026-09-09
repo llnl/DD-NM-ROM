@@ -37,7 +37,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.VENV_PATH }}
-          key: ${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-venv-${{ hashFiles('.github/requirements.txt') }}
+          key: ${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-venv-${{ hashFiles('.github/requirements.txt', '.github/workflows/ci.yml') }}
 
       - name: Create and install virtualenv
         if: steps.virtualenv-cache.outputs.cache-hit != 'true'
@@ -54,19 +54,13 @@ jobs:
             bash conda/llnl_toss/install_sparselinear.sh
           "${VENV_PATH}/bin/python" -m pip install --no-deps --editable .
 
-  unit-tests:
-    name: Unit tests (${{ matrix.backend }})
+  serial-tests:
+    name: Serial tests
     needs: setup-environment
     runs-on: ubuntu-latest
     env:
       DDNMROM_VERBOSE: "1"
       DDNMROM_LOG_LEVEL: "20"
-    strategy:
-      fail-fast: false
-      matrix:
-        backend:
-          - numpy
-          - torch_cpu
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -82,84 +76,67 @@ jobs:
           mpi: 'openmpi'
 
       - name: Restore virtualenv
+        id: virtualenv-cache
         uses: actions/cache@v4
         with:
           path: ${{ env.VENV_PATH }}
-          key: ${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-venv-${{ hashFiles('.github/requirements.txt') }}
+          key: ${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-venv-${{ hashFiles('.github/requirements.txt', '.github/workflows/ci.yml') }}
 
-      - name: Run unit tests
+      - name: Run NumPy unit tests
         run: |
           "${VENV_PATH}/bin/python" -m pytest tests \
             -v --tb=short \
-            --backend="${{ matrix.backend }}" \
+            --backend=numpy \
             -m "not packaging"
 
-  parallel-tests:
-    name: Parallel tests (ranks=${{ matrix.ranks }})
-    needs: unit-tests
-    runs-on: ubuntu-latest
-    env:
-      DDNMROM_VERBOSE: "1"
-      DDNMROM_LOG_LEVEL: "20"
-    strategy:
-      fail-fast: false
-      matrix:
-        ranks:
-          - 2
-          - 4
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Setup MPI
-        uses: mpi4py/setup-mpi@v1
-        with:
-          mpi: 'openmpi'
-
-      - name: Restore virtualenv
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.VENV_PATH }}
-          key: ${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-venv-${{ hashFiles('.github/requirements.txt') }}
-
-      - name: Run parallel tests
+      - name: Run Torch CPU unit tests
         run: |
-          mpiexec -n "${{ matrix.ranks }}" \
-            "${VENV_PATH}/bin/python" -m pytest tests \
+          "${VENV_PATH}/bin/python" -m pytest tests \
             -v --tb=short \
-            --with-mpi \
             --backend=torch_cpu \
-            -m mpi
-
-  packaging-tests:
-    name: Packaging tests
-    needs:
-      - unit-tests
-      - parallel-tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Restore virtualenv
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.VENV_PATH }}
-          key: ${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-venv-${{ hashFiles('.github/requirements.txt') }}
+            -m "not packaging"
 
       - name: Run packaging tests
         run: |
           "${VENV_PATH}/bin/python" -m pytest tests \
             -v --tb=short \
-            -m packaging \
-            --backend=torch_cpu
+            -m packaging
+
+  parallel-tests:
+    name: Parallel tests
+    needs: setup-environment
+    runs-on: ubuntu-latest
+    env:
+      DDNMROM_VERBOSE: "1"
+      DDNMROM_LOG_LEVEL: "20"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Setup MPI
+        uses: mpi4py/setup-mpi@v1
+        with:
+          mpi: 'openmpi'
+
+      - name: Restore virtualenv
+        id: virtualenv-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VENV_PATH }}
+          key: ${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-venv-${{ hashFiles('.github/requirements.txt', '.github/workflows/ci.yml') }}
+
+      - name: Run parallel tests at ranks 2 and 4
+        run: |
+          for ranks in 2 4; do
+            mpiexec -n "${ranks}" \
+              "${VENV_PATH}/bin/python" -m pytest tests \
+              -v --tb=short \
+              --with-mpi \
+              --backend=torch_cpu \
+              -m mpi
+          done

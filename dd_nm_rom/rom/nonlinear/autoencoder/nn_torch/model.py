@@ -118,7 +118,8 @@ class Model(object):
       if bkd.distributed():
         with self.ddp_net.join(throw_on_early_termination=True):
           self.train_sgd()
-        torch.cuda.synchronize()
+        if bkd.device().type == "cuda":
+          torch.cuda.synchronize()
         bkd._COMM.Barrier()
       else:
         self.train_sgd()
@@ -203,12 +204,17 @@ class Model(object):
         torch.save(self.net.state_dict_np(), filename+"_numpy.p")
 
         # Save complete checkpoint with optimizer and scheduler state
+        random_state = (
+            torch.cuda.get_rng_state(device=bkd.device())
+            if bkd.device().type == "cuda"
+            else torch.get_rng_state()
+        )
         checkpoint = {
             'model_state_dict': self.ddp_net.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'epoch': self.train_state.epoch,
             'random_state_np': np.random.get_state(),
-            'random_state': torch.cuda.get_rng_state(device=bkd.device()),
+            'random_state': random_state,
             'metadata': self.meta
         }
 
@@ -238,7 +244,10 @@ class Model(object):
     # Restore random state
     if 'random_state' in checkpoint:
       np.random.set_state(checkpoint['random_state_np'])
-      torch.cuda.set_rng_state(checkpoint['random_state'], device=bkd.device())
+      if bkd.device().type == "cuda":
+        torch.cuda.set_rng_state(checkpoint['random_state'], device=bkd.device())
+      else:
+        torch.set_rng_state(checkpoint['random_state'])
 
     if bkd.distributed():
       dist.barrier()

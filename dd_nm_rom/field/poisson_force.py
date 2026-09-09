@@ -54,7 +54,7 @@ class PoissonForce(BasicField):
     freq_y = 2 * np.random.randint(1, 4)  # Will give 2, 4, or 6
 
     mu = np.concatenate([force_magnitudes, [freq_x, freq_y]])
-    return mu
+    return self._broadcast(mu)
 
   def construct_design_mat(
     self,
@@ -66,7 +66,7 @@ class PoissonForce(BasicField):
         dmat[:, self.mesh.n_sub - 1] = (
           dmat[:, 1] + dmat[:, 2] - dmat[:, 0]
         )
-      return self._convert_dmat_to_mu(dmat, mask)
+      return self._broadcast(self._convert_dmat_to_mu(dmat, mask))
 
     # Legacy LHS path.
     dmat = super(PoissonForce, self).construct_design_mat(n_samples)
@@ -79,7 +79,7 @@ class PoissonForce(BasicField):
         # Assumption: mu_lim is something like [0.9, 1.1]
 #       min_val, max_val = self.mu_lim
 #       dmat[:, 4] = np.clip(dmat[:, 4], min_val, max_val)
-    return self._convert_dmat_to_mu(dmat)
+    return self._broadcast(self._convert_dmat_to_mu(dmat))
 
   def _convert_dmat_to_mu(
     self,

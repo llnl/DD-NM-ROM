@@ -81,7 +81,7 @@ class MultiPeakGen(BasicField):
     mu_u = config1 * np.random.uniform(*self.mu_lim, size=self.mesh.n_sub)
     mu_v = config2 * np.random.uniform(*self.mu_lim, size=self.mesh.n_sub)
 
-    return np.concatenate([mu_u, mu_v])
+    return self._broadcast(np.concatenate([mu_u, mu_v]))
 
   def construct_design_mat(
     self,
@@ -116,7 +116,7 @@ class MultiPeakGen(BasicField):
       dmat_v, mask_v = super(MultiPeakGen, self).construct_design_mat_qmc(
         n_samples, design_space=self.design_space_v
       )
-      return self._convert_dmat_to_mu(dmat_u, dmat_v, mask_u, mask_v)
+      return self._broadcast(self._convert_dmat_to_mu(dmat_u, dmat_v, mask_u, mask_v))
 
     # Legacy LHS path.
     ddim = self.design_space_u.shape[1]
@@ -127,7 +127,7 @@ class MultiPeakGen(BasicField):
     dmat_u = dmat_u * (amax - amin) + amin
     amin, amax = self.design_space_v
     dmat_v = dmat_v * (amax - amin) + amin
-    return self._convert_dmat_to_mu(dmat_u, dmat_v)
+    return self._broadcast(self._convert_dmat_to_mu(dmat_u, dmat_v))
 
   def _convert_dmat_to_mu(
     self,

@@ -1,0 +1,22 @@
+# Minimal dependencies for the unit and packaging tests on GitHub-hosted runners.
+build
+dask
+dill
+joblib
+matplotlib
+mpi4py
+numpy
+numpy-indexed
+pandas
+pyDOE
+pyinstrument
+scipy
+setuptools>=68
+torch-sla==0.3.2
+torchinfo
+tqdm
+typing-extensions
+pytest
+pytest-mpi
+pytest-timeout
+wheel

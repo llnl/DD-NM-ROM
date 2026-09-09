@@ -69,7 +69,7 @@ class MultiPeak(BasicField):
     mu_u = config * np.random.uniform(*self.mu_lim, size=self.mesh.n_sub)
     mu_v = config * np.random.uniform(*self.mu_lim, size=self.mesh.n_sub)
 
-    return np.concatenate([mu_u, mu_v])
+    return self._broadcast(np.concatenate([mu_u, mu_v]))
 
   def construct_design_mat(
     self,
@@ -98,9 +98,9 @@ class MultiPeak(BasicField):
     """
     if self.use_qmc:
       dmat, mask = super(MultiPeak, self).construct_design_mat_qmc(n_samples)
-      return self._convert_dmat_to_mu(dmat, mask)
+      return self._broadcast(self._convert_dmat_to_mu(dmat, mask))
     dmat = super(MultiPeak, self).construct_design_mat(n_samples)
-    return self._convert_dmat_to_mu(dmat)
+    return self._broadcast(self._convert_dmat_to_mu(dmat))
 
   def _convert_dmat_to_mu(
     self,

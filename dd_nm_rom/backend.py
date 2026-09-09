@@ -88,7 +88,7 @@ def set(
       # TODO: fix this to work for multiple nodes!
       #device_idx = _RANK % _NRANKS
       device_idx = 0
-      print(" BACKEND: RANK {} reassigning device_idx to {}".format(_RANK, device_idx))
+      logger.info("BACKEND: RANK %s reassigning device_idx to %s", _RANK, device_idx)
 
     #if _NRANKS > 1:
     #  device_idx = _RANK
@@ -798,7 +798,8 @@ def set_seed(
     random.seed(value)
     np.random.seed(value)
     torch.manual_seed(value)
-    torch.cuda.manual_seed_all(value)
+    if torch.cuda.is_available():
+      torch.cuda.manual_seed_all(value)
     # torch.use_deterministic_algorithms(True)
     os.environ["PYTHONHASHSEED"] = str(value)
 
@@ -823,7 +824,9 @@ def init_distributed(backend_type: str = "cuda") -> None:
   :return: None
   :rtype: None
   """
-  print(" BEFORE INIT DIST: TORCH device counts = {}".format(torch.cuda.device_count()))
+  is_cuda = backend_type != "cpu"
+  device_count = torch.cuda.device_count() if is_cuda else 0
+  logger.debug("BEFORE INIT DIST: TORCH device counts = %s", device_count)
 
   global _COMM, _RANK, _NRANKS
   if dist.is_available() and dist.is_initialized():
@@ -833,7 +836,7 @@ def init_distributed(backend_type: str = "cuda") -> None:
   _RANK = _COMM.Get_rank()
   _NRANKS = _COMM.Get_size()
 
-  print(" INIT DISTRIBUTED: rank = {}, num ranks = {}".format(_RANK, _NRANKS))
+  logger.debug("INIT DISTRIBUTED: rank = %s, num ranks = %s", _RANK, _NRANKS)
 
   if _NRANKS > 1:
     # Broadcast root hostname to all other ranks
@@ -857,8 +860,12 @@ def init_distributed(backend_type: str = "cuda") -> None:
 
     backend = "gloo" if backend_type == "cpu" else "nccl"
 
-    print("  Creating torch process group: world size = {} rank = {}, backend type = '{}'".format(world_size, rank_env, backend))
-    print("   RANK {} number of available devices = {}".format(_RANK, torch.accelerator.device_count()))
+    logger.info(
+      "Creating torch process group: world size = %s rank = %s, backend type = '%s'",
+      world_size, rank_env, backend,
+    )
+    available_devices = torch.accelerator.device_count() if is_cuda else 1
+    logger.info("RANK %s number of available devices = %s", _RANK, available_devices)
     #devid = _RANK % _DEVICE_PER_RANK
     # if torch.accelerator.device_count() > 1:
     #   devid = _DEVICE_PER_RANK // torch.accelerator.device_count()
@@ -889,10 +896,16 @@ def init_distributed(backend_type: str = "cuda") -> None:
     
     init_device_mesh(backend_type, use_2d=False)
   else:
-    print("Serial mode; no distributed!")
+    logger.info("Serial mode; no distributed")
 
-  print("   RANK {}: Initialized on device '{}'".format(_RANK, torch.cuda.get_device_name()))
-  print("   RANK {}:   Device properties: {}".format(_RANK, torch.cuda.get_device_properties()))
+  if is_cuda:
+    device_name = torch.cuda.get_device_name()
+    device_properties = torch.cuda.get_device_properties()
+  else:
+    device_name = str(_DEVICE)
+    device_properties = "CPU"
+  logger.info("RANK %s: Initialized on device '%s'", _RANK, device_name)
+  logger.info("RANK %s: Device properties: %s", _RANK, device_properties)
 
 
 def init_device_mesh(backend_type: str, use_2d: bool = True) -> None:
@@ -922,10 +935,10 @@ def init_device_mesh(backend_type: str, use_2d: bool = True) -> None:
     mesh = (_NRANKS,)
     dims = ("GLOBAL",)
 
-  print("   RANK {}:   Initializing device mesh {} ({})".format(_RANK, mesh, dims))
+  logger.info("RANK %s: Initializing device mesh %s (%s)", _RANK, mesh, dims)
   global _DMESH
   _DMESH = dist.init_device_mesh(backend_type, mesh_shape=mesh)#, mesh_dim_names=dims)
-  print("   RANK {}:   Initialized device mesh: {}".format(_RANK, _DMESH))
+  logger.info("RANK %s: Initialized device mesh: %s", _RANK, _DMESH)
 
 
 def finalize_distributed() -> None:
@@ -991,9 +1004,28 @@ def barrier() -> None:
   if not distributed():
     return
 
-  torch.accelerator.synchronize()
+  if _DEVICE.type == "cuda":
+    torch.accelerator.synchronize()
   _COMM.Barrier()
   dist.barrier()
+
+
+def bcast(value: Any, root: int = 0) -> Any:
+  """
+  Broadcast a value from the given rank to all other ranks.
+
+  In serial execution, the value is returned unchanged.
+
+  :param value: Value to broadcast.
+  :type value: Any
+  :param root: Rank that provides the value.
+  :type root: int
+  :return: The broadcast value.
+  :rtype: Any
+  """
+  if not distributed():
+    return value
+  return _COMM.bcast(value, root=root)
 
 
 def root() -> bool:
@@ -1088,6 +1120,15 @@ def get_local_shape(
   return rank_sizes
 
 
+def _ensure_contiguous(
+  x: Union[torch.Tensor, List[torch.Tensor]],
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+  """Return tensor inputs with contiguous storage when required by MPI."""
+  if isinstance(x, list):
+    return [value if value.is_contiguous() else value.contiguous() for value in x]
+  return x if x.is_contiguous() else x.contiguous()
+
+
 def gather_tensor(
   x: torch.Tensor,
   sizes: Optional[List[int]] = None,
@@ -1126,6 +1167,7 @@ def gather_tensor(
     x_sparse = True
     assert x.layout == torch.sparse_csr
     x = x.to_dense()
+  x = _ensure_contiguous(x)
 
   data = None
 
@@ -1296,9 +1338,12 @@ def gatherv_tensor(
 
   #assert x.storage_offset() == 0
 
-  # NOTE: bus error without cpu below: (5/15)
-  #_COMM.Gatherv([x.cpu(), x.numel(), dtype], [data, rank_sizes, rank_offsets, dtype], root)
-  _COMM.Gatherv(x.cpu(), [data, rank_sizes, rank_offsets, dtype], root)
+  # mpi4py requires a contiguous host buffer.  State vectors assembled by the
+  # DD-FOM are frequently tensor views, and passing those views directly can
+  # trigger DLPack ``buffer is not contiguous`` errors.
+  send_buffer = _ensure_contiguous(x).detach().cpu().numpy()
+  recv_buffer = data.numpy() if _RANK == root else None
+  _COMM.Gatherv(send_buffer, [recv_buffer, rank_sizes, rank_offsets, dtype], root)
 
   #data = comm.gather(x, dim=dim, out=data)
   #tmp = comm.gather(x, dim=dim)
@@ -1481,7 +1526,8 @@ def scatter_tensor(
   data = None
   if _RANK == root:
     if not as_list:
-      data = list(torch.tensor_split(x, _NRANKS, dim=dim))
+      x = _ensure_contiguous(x)
+      data = _ensure_contiguous(list(torch.tensor_split(x, _NRANKS, dim=dim)))
       full_size = x.shape[dim]
       assert len(data) == _NRANKS
       if x_out is None:
@@ -1489,6 +1535,7 @@ def scatter_tensor(
         full_size[dim] = x.shape[dim] // _NRANKS
     else:
       assert len(x) == _NRANKS
+      x = _ensure_contiguous(x)
       full_size = x[0].shape[dim]
 
   if x_out is None:
@@ -1501,6 +1548,7 @@ def scatter_tensor(
         x_out.append(torch.empty(full_size, device=device()))
 
   barrier()
+  x_out = _ensure_contiguous(x_out)
   if not as_list:
     dist.scatter(x_out, data, root)
   else:
@@ -1568,9 +1616,14 @@ def broadcast_tensor(
   out_size = _COMM.bcast(out_size, root=root)
   dtype = _COMM.bcast(dtype, root=root)
 
-  if _RANK != root and x_out is None:
-    # create output space on all other ranks
-    x = torch.zeros(out_size, dtype=dtype, device=device())
+  if _RANK != root:
+    if x_out is None:
+      # create output space on all other ranks
+      x = torch.zeros(out_size, dtype=dtype, device=device())
+    else:
+      x = x_out
+
+  x = _ensure_contiguous(x)
 
   dist.broadcast(x, src=root)
 

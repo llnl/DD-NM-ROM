@@ -87,7 +87,7 @@ class ElasticityForce(BasicField):
         freq_y = 2 * np.random.randint(1, 4)
 
         mu = np.concatenate([force_magnitudes_x, force_magnitudes_y, [freq_x, freq_y]])
-        return mu
+        return self._broadcast(mu)
 
     def construct_design_mat(
         self,
@@ -101,7 +101,7 @@ class ElasticityForce(BasicField):
                 dmat[:, n - 1] = dmat[:, 1] + dmat[:, 2] - dmat[:, 0]
                 min_val_x, max_val_x = self.mu_lim_x
                 dmat[:, n - 1] = np.clip(dmat[:, n - 1], min_val_x, max_val_x)
-            return self._convert_dmat_to_mu(dmat, mask)
+            return self._broadcast(self._convert_dmat_to_mu(dmat, mask))
 
         # Legacy LHS path.
         dmat = super(ElasticityForce, self).construct_design_mat(n_samples)
@@ -117,7 +117,7 @@ class ElasticityForce(BasicField):
             min_val_x, max_val_x = self.mu_lim_x
             dmat[:, 4] = np.clip(dmat[:, 4], min_val_x, max_val_x)
             
-        return self._convert_dmat_to_mu(dmat)
+        return self._broadcast(self._convert_dmat_to_mu(dmat))
 
     def _convert_dmat_to_mu(
         self,

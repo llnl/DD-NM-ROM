@@ -25,14 +25,6 @@ from dd_nm_rom import rom as rom_mod
 from dd_nm_rom.rom.nonlinear.autoencoder import AutoencoderNP
 
 
-def setup_module(module):
-  bkd.set_backend("torch")
-  bkd.set_device("cpu")
-  bkd.set_floatx("float64")
-
-def teardown_module(module):
-  bkd.finalize_distributed()
-
 @pytest.mark.setup("backend_numpy")
 def test_autoencoder_clone():
   # Test the makeShared op on Autoencoder - all pointers should be equal between two instances

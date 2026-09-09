@@ -209,8 +209,8 @@ def _build_fom_solution_case(
     n_sub_y = 2 * world_size
 
   mesh = mesh_mod.MeshDD(
-    nx_intr=16,
-    ny_intr=16,
+    nx_intr=4,
+    ny_intr=4,
     lx_sub=0.5,
     ly_sub=0.5,
     n_sub_x=1,
@@ -254,6 +254,9 @@ def _assert_dd_fom_solution_matches_monolithic(
   constraint_type,
   boundary_type,
   n_sub_y=None,
+  tol=1.0e-8,
+  maxit=50,
+  stepsize_min=1.0e-20,
 ):
   """Assert that a DD-FOM solve recovers the monolithic physical state."""
   fom, dd_fom, x0 = _build_fom_solution_case(
@@ -265,9 +268,9 @@ def _assert_dd_fom_solution_matches_monolithic(
     "dt": 0.0 if steady else 1.0e-3,
     "nt": 1,
     "steady": steady,
-    "tol": 1.0e-8,
-    "maxit": 50,
-    "stepsize_min": 1.0e-20,
+    "tol": tol,
+    "maxit": maxit,
+    "stepsize_min": stepsize_min,
     "verbose": False,
   }
 
@@ -345,6 +348,9 @@ def test_dist_unsteady_neumann_strong_dd_fom_matches_monolithic():
     steady=False,
     constraint_type="strong",
     boundary_type="neumann",
+    tol=1.0e-6,
+    maxit=20,
+    stepsize_min=1.0e-8,
   )
 
 

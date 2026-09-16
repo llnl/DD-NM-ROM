@@ -35,6 +35,8 @@ _DEVICE_PER_RANK = 4
 
 _USE_ZEROFILL = cfg.get_config_val("DDNMROM_MPI_BUFFER_ZEROFILL")
 _DTENSOR_CHECKS = cfg.get_config_val("DDNMROM_DTENSOR_CHECKS")
+_GATHERV_PLAN_CACHE = {}
+_GATHERV_LIST_PLAN_CACHE = {}
 
 # Setting
 # -------------------------------------
@@ -76,6 +78,8 @@ def set(
   :rtype: None
   """
   global _DEVICE_PER_RANK
+  _GATHERV_PLAN_CACHE.clear()
+  _GATHERV_LIST_PLAN_CACHE.clear()
   _DEVICE_PER_RANK = cfg.update_from_env("DDNMROM_DEVICE_PER_NODE", _DEVICE_PER_RANK)
 
   set_backend(backend)
@@ -1250,7 +1254,9 @@ def gatherv_tensor(
   dim: int = 0,
   root: int = 0,
   as_list: bool = False,
-  coalesce: bool = False
+  coalesce: bool = False,
+  cache_key: Optional[Any] = None,
+  validate_cache: bool = False
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
   """
   Gathers the local tensor x from each rank onto root rank.
@@ -1275,6 +1281,12 @@ def gatherv_tensor(
   :type as_list: bool
   :param coalesce: Coalesce sparse COO input before gathering.
   :type coalesce: bool
+  :param cache_key: Stable operation key used to cache rank sizes and receive
+    offsets across repeated gathers.
+  :type cache_key: Any
+  :param validate_cache: Check whether a cached plan's local size changed on
+    any rank. This is needed for dynamic sparse ``nnz`` sizes.
+  :type validate_cache: bool
 
   :return: Gathered data on root, or the local tensor on other ranks.
   :rtype: torch.Tensor or list[torch.Tensor]
@@ -1290,11 +1302,42 @@ def gatherv_tensor(
         x[i] = x[i].to_sparse_coo()
         
 
-    sub_sizes = [s.shape[dim] for s in x]
+    sub_sizes = tuple(int(s.shape[dim]) for s in x)
     tmp = torch.cat(x, dim=dim)#.contiguous()
-    res = gatherv_tensor(tmp, sizes, offsets, dim, root, as_list)
+    res = gatherv_tensor(tmp, sizes, offsets, dim, root, as_list,
+                         cache_key=cache_key, validate_cache=validate_cache)
     if as_list:
-      sub_sizes = _COMM.gather(sub_sizes, root=root)
+      if cache_key is None:
+        # Preserve the dynamic path for callers without a stable operation
+        # key. MPI rank order and each rank's local list order are retained.
+        sub_sizes = _COMM.gather(sub_sizes, root=root)
+      else:
+        list_shape_key = tuple(tmp.shape[:dim] + tmp.shape[dim + 1:])
+        list_plan_key = (cache_key, dim, root, list_shape_key)
+        list_plan = _GATHERV_LIST_PLAN_CACHE.get(list_plan_key)
+        if list_plan is None:
+          all_sub_sizes = tuple(_COMM.allgather(sub_sizes))
+          list_plan = {
+            "local_sub_sizes": sub_sizes,
+            "all_sub_sizes": all_sub_sizes,
+          }
+          _GATHERV_LIST_PLAN_CACHE[list_plan_key] = list_plan
+        else:
+          any_changed = False
+          if validate_cache:
+            changed = int(sub_sizes != list_plan["local_sub_sizes"])
+            # Keep all ranks on the same collective branch when a local
+            # subdomain list changes.
+            any_changed = bool(_COMM.allreduce(changed, op=MPI.MAX))
+          if any_changed:
+            all_sub_sizes = tuple(_COMM.allgather(sub_sizes))
+            list_plan = {
+              "local_sub_sizes": sub_sizes,
+              "all_sub_sizes": all_sub_sizes,
+            }
+            _GATHERV_LIST_PLAN_CACHE[list_plan_key] = list_plan
+        if _RANK == root:
+          sub_sizes = list_plan["all_sub_sizes"]
     if _RANK == root:
       if as_list:
         for r in range(len(res)):
@@ -1312,10 +1355,12 @@ def gatherv_tensor(
     return res
 
   if x.is_sparse:
-    return gatherv_spcoo(x, sizes, offsets, dim, root, as_list, coalesce=coalesce)
+    return gatherv_spcoo(x, sizes, offsets, dim, root, as_list,
+                         coalesce=coalesce, cache_key=cache_key)
 
   if x.is_sparse_csr:
-    return gatherv_spcsr(x, sizes, offsets, dim, root, as_list)
+    return gatherv_spcsr(x, sizes, offsets, dim, root, as_list,
+                         cache_key=cache_key)
 
   data = None
   data_ptr = None
@@ -1323,15 +1368,44 @@ def gatherv_tensor(
   rank_sizes = sizes
   rank_offsets = offsets
   calc_sizes = False
-  #if (rank_sizes is None or rank_offsets is None) and _RANK == root:
-  if rank_sizes is None and _RANK == root:
-    # if rank sizes is undefined on root rank, then we need to determine the sizes
-    calc_sizes = True
-  calc_sizes = _COMM.bcast(calc_sizes, root=root)
-  barrier()
-
-  if calc_sizes:
-    rank_sizes = get_local_sizes(x, dim, root)
+  cache_plan = None
+  if rank_sizes is None and cache_key is not None:
+    shape_key = tuple(x.shape[:dim] + x.shape[dim + 1:])
+    plan_key = (cache_key, dim, root, shape_key)
+    cache_plan = _GATHERV_PLAN_CACHE.get(plan_key)
+    if cache_plan is None:
+      rank_sizes = tuple(int(n) for n in _COMM.allgather(int(x.shape[dim])))
+      cache_plan = {
+        "local_size": int(x.shape[dim]),
+        "sizes": rank_sizes,
+      }
+      _GATHERV_PLAN_CACHE[plan_key] = cache_plan
+    else:
+      any_changed = False
+      if validate_cache:
+        changed = int(int(x.shape[dim]) != cache_plan["local_size"])
+        # All ranks must take the same cache/rebuild branch. Do not put the
+        # local size directly in plan_key because ranks may change sizes
+        # independently.
+        any_changed = bool(_COMM.allreduce(changed, op=MPI.MAX))
+      if any_changed:
+        rank_sizes = tuple(int(n) for n in _COMM.allgather(int(x.shape[dim])))
+        cache_plan = {
+          "local_size": int(x.shape[dim]),
+          "sizes": rank_sizes,
+        }
+        _GATHERV_PLAN_CACHE[plan_key] = cache_plan
+      else:
+        rank_sizes = cache_plan["sizes"]
+  elif rank_sizes is None:
+    # Preserve dynamic discovery for callers without a stable operation key.
+    # If rank sizes are undefined on root rank, determine the sizes before
+    # allocating the receive buffer.
+    calc_sizes = _RANK == root
+    calc_sizes = _COMM.bcast(calc_sizes, root=root)
+    barrier()
+    if calc_sizes:
+      rank_sizes = get_local_sizes(x, dim, root)
 
   if _RANK == root:
     total_size = list(x.shape)
@@ -1347,9 +1421,14 @@ def gatherv_tensor(
     rank_sizes = [r * np.prod(other_dims, dtype=int) for r in rank_sizes]
 
     if rank_offsets is None:
-      rank_offsets  = [int(0)]
-      for rank in range(1, _NRANKS):
-        rank_offsets.append(rank_offsets[rank-1] + rank_sizes[rank-1])
+      if cache_plan is not None and "offsets" in cache_plan:
+        rank_offsets = cache_plan["offsets"]
+      else:
+        rank_offsets  = [int(0)]
+        for rank in range(1, _NRANKS):
+          rank_offsets.append(rank_offsets[rank-1] + rank_sizes[rank-1])
+        if cache_plan is not None:
+          cache_plan["offsets"] = tuple(rank_offsets)
 
     alloc_fn = torch.zeros if _USE_ZEROFILL else torch.empty
     use_device_buffer = mpi_gpu_aware() and x.device.type == "cuda"
@@ -1385,8 +1464,6 @@ def gatherv_tensor(
   #tmp = comm.gather(x, dim=dim)
   #print(" GATHERV OUT: ", tmp)
 
-  barrier()
-
   if _RANK == root and as_list:
     data = data.to(device())
     # Root rank stacks all gathered tensors
@@ -1419,7 +1496,8 @@ def gatherv_spcoo(
   dim: int = 0,
   root: int = 0,
   as_list: bool = False,
-  coalesce: bool = False
+  coalesce: bool = False,
+  cache_key: Optional[Any] = None
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
   """
   Wrapper around gatherv for sparse coo tensors. This is usually called by gatherv
@@ -1439,6 +1517,9 @@ def gatherv_spcoo(
   :type as_list: bool
   :param coalesce: Coalesce the COO tensor before gathering.
   :type coalesce: bool
+  :param cache_key: Stable operation key used to cache rank sizes and receive
+    offsets across repeated gathers.
+  :type cache_key: Any
 
   :return: Gathered sparse data on root, or the local tensor on other ranks.
   :rtype: torch.Tensor or list[torch.Tensor]
@@ -1451,10 +1532,15 @@ def gatherv_spcoo(
 
   assert x.layout == torch.sparse_coo
 
-  indices = gatherv_tensor(x._indices().ravel(), sizes, offsets, dim=0, root=root, as_list=True)
+  indices = gatherv_tensor(x._indices().ravel(), sizes, offsets, dim=0,
+                           root=root, as_list=True,
+                           cache_key=(cache_key, "indices"),
+                           validate_cache=True)
 
 
-  values = gatherv_tensor(x._values(), sizes, offsets, dim=0, root=root, as_list=True)
+  values = gatherv_tensor(x._values(), sizes, offsets, dim=0, root=root,
+                          as_list=True, cache_key=(cache_key, "values"),
+                          validate_cache=True)
 
   shapes = _COMM.gather(x.shape)
 
@@ -1479,7 +1565,8 @@ def gatherv_spcsr(
   offsets: Optional[List[int]] = None,
   dim: int = 0,
   root: int = 0,
-  as_list: bool = False
+  as_list: bool = False,
+  cache_key: Optional[Any] = None
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
   """
   Wrapper around gatherv for sparse csr tensors. This is usually called by gatherv
@@ -1505,9 +1592,17 @@ def gatherv_spcsr(
     return x
 
   assert x.layout == torch.sparse_csr
-  crow_indices = gatherv_tensor(x.crow_indices(), sizes, offsets, dim=0, root=root, as_list=True)
-  col_indices = gatherv_tensor(x.col_indices(), sizes, offsets, dim=0, root=root, as_list=True)
-  values = gatherv_tensor(x.values(), sizes, offsets, dim=0, root=root, as_list=True)
+  crow_indices = gatherv_tensor(x.crow_indices(), sizes, offsets, dim=0,
+                                root=root, as_list=True,
+                                cache_key=(cache_key, "crow_indices"),
+                                validate_cache=True)
+  col_indices = gatherv_tensor(x.col_indices(), sizes, offsets, dim=0,
+                               root=root, as_list=True,
+                               cache_key=(cache_key, "col_indices"),
+                               validate_cache=True)
+  values = gatherv_tensor(x.values(), sizes, offsets, dim=0, root=root,
+                          as_list=True, cache_key=(cache_key, "values"),
+                          validate_cache=True)
 
   shapes = _COMM.gather(x.shape)
 

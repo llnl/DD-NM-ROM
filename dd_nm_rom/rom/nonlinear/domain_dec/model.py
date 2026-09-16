@@ -654,7 +654,8 @@ class DD_NM_ROM(object):
     if bkd.distributed():
       if use_global:
         # assemble global residual
-        global_res = [bkd.gatherv_tensor(r, as_list=True) for r in res]
+        global_res = [bkd.gatherv_tensor(r, as_list=True, cache_key=("rom-residual", i))
+                      for i, r in enumerate(res)]
         dist.reduce(cres, dst=0, op=dist.ReduceOp.SUM)
         if bkd.root():
           res = self.dd_fom.flatten_across_domain(global_res)
@@ -798,9 +799,13 @@ class DD_NM_ROM(object):
     if bkd.distributed():
       if use_global:
         dist.reduce(cres, dst=0, op=dist.ReduceOp.SUM)
-        global_res = [bkd.gatherv_tensor(r, as_list=True) for r in res]
-        global_cjac = [bkd.gatherv_tensor(r, dim=1, as_list=True, coalesce=True) for r in cjac]
-        global_hess = [bkd.gatherv_tensor(r, as_list=True) for r in hess]
+        global_res = [bkd.gatherv_tensor(r, as_list=True, cache_key=("rom-residual", i))
+                      for i, r in enumerate(res)]
+        global_cjac = [bkd.gatherv_tensor(r, dim=1, as_list=True, coalesce=True,
+                                          cache_key=("rom-cjac", i))
+                       for i, r in enumerate(cjac)]
+        global_hess = [bkd.gatherv_tensor(r, as_list=True, cache_key=("rom-hess", i))
+                       for i, r in enumerate(hess)]
 
         bkd.barrier()
 
@@ -1082,7 +1087,7 @@ class DD_NM_ROM(object):
       x_s = enc[:offset]
       x_c = enc[offset:]
 
-      global_x_s = bkd.gatherv_tensor(x_s, as_list=True)
+      global_x_s = bkd.gatherv_tensor(x_s, as_list=True, cache_key="rom-init-state")
       if bkd.root():
         x_s = torch.cat(global_x_s)
       dist.reduce(x_c, dst=0, op=dist.ReduceOp.SUM)

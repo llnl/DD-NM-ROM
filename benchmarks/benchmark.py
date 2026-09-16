@@ -18,6 +18,7 @@ import argparse
 import copy
 import importlib
 import json
+import os
 import platform
 import shlex
 import socket
@@ -37,6 +38,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 BACKENDS = ("numpy", "torch_cpu", "torch_gpu")
 LAUNCHERS = ("local", "slurm", "flux")
+ENV_PROFILE_DIR = Path(__file__).resolve().parent / "env"
 
 
 def _parse_ranks(value: str) -> list[int]:
@@ -326,6 +328,32 @@ def _base_command(
     return command
 
 
+def _resolve_env_profile(configured: Path | None) -> Path | None:
+    """Resolve the optional site module/runtime profile for batch jobs."""
+    if configured is not None:
+        profile = configured.expanduser().resolve()
+        if not profile.is_file():
+            raise ValueError(f"benchmark environment profile does not exist: {profile}")
+        return profile
+
+    configured_by_env = os.environ.get("DDNMROM_BENCHMARK_ENV_PROFILE")
+    if configured_by_env:
+        profile = Path(configured_by_env).expanduser().resolve()
+        if not profile.is_file():
+            raise ValueError(f"benchmark environment profile does not exist: {profile}")
+        return profile
+
+    system_name = {
+        "toss_4_x86_64_ib": "toss",
+        "toss_4_x86_64_ib_cray": "tuo",
+        "blueos_3_ppc64le_ib_p9": "coral",
+    }.get(os.environ.get("SYS_TYPE"))
+    if system_name is None:
+        return None
+    profile = ENV_PROFILE_DIR / f"{system_name}.bash"
+    return profile if profile.is_file() else None
+
+
 def _scheduler_script(
     args: argparse.Namespace,
     spec_path: Path,
@@ -369,7 +397,12 @@ def _scheduler_script(
     command = launch + _base_command(
         args, spec_path, rank, output, case_name=case_name, overrides=overrides
     )
-    return "#!/bin/bash\n" + header + "\nset -euo pipefail\n" + " ".join(shlex.quote(x) for x in command) + "\n"
+    profile = _resolve_env_profile(args.env_profile)
+    setup = f"source {shlex.quote(str(profile))}\n" if profile else ""
+    return (
+        "#!/bin/bash\n" + header + "\nset -euo pipefail\n" + setup
+        + " ".join(shlex.quote(x) for x in command) + "\n"
+    )
 
 
 def _write_result(path: Path, spec: dict[str, Any], result: dict[str, Any]) -> None:
@@ -425,7 +458,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("benchmark_jobs"))
     parser.add_argument("--submit", action="store_true", help="Submit generated scheduler scripts")
-    parser.add_argument("--python", default=".venv/bin/python")
+    parser.add_argument(
+        "--python",
+        default=".venv/bin/python",
+        help="Python executable for benchmark workers (default: .venv/bin/python)",
+    )
+    parser.add_argument(
+        "--env-profile",
+        type=Path,
+        help=(
+            "Shell profile to source in scheduler jobs; otherwise use "
+            "DDNMROM_BENCHMARK_ENV_PROFILE or a SYS_TYPE-matched profile"
+        ),
+    )
     parser.add_argument(
         "--mpi-launcher",
         default="mpiexec -n {ranks}",

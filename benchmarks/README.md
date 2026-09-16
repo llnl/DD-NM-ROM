@@ -51,6 +51,22 @@ convention by default: `-N <nodes> -x -n <tasks> -g 1 -c 1
 -vvv --setopt=mpibind=verbose:1`. Add `--submit` to submit the generated
 scripts.
 
+Scheduler jobs can source a site-specific module and runtime profile:
+
+```text
+.venv/bin/python benchmarks/benchmark.py \
+  --spec benchmarks/specs/dd_fom_steady.json \
+  --backend torch_gpu --launcher flux --ranks 1,2,4 \
+  --env-profile benchmarks/env/tuo.bash \
+  --python .venv/bin/python
+```
+
+If `--env-profile` is omitted, the runner checks
+`DDNMROM_BENCHMARK_ENV_PROFILE`, then selects a profile from `SYS_TYPE` when a
+matching file exists. Profiles only load modules and export runtime settings;
+the benchmark is still launched once per Flux task. The default worker
+interpreter is `.venv/bin/python` and can be replaced with `--python`.
+
 Project DD-FOM/DD-ROM workloads can be added as separate modules using the
 same protocol. This keeps benchmark timing independent of pytest setup,
 assertions, and profiler output. The rank count must divide the workload's

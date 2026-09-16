@@ -5,8 +5,8 @@
   "repetitions": 1,
   "threads": 8,
   "config": {
-    "n_sub_x": 4,
-    "n_sub_y": 4,
+    "n_sub_x": 6,
+    "n_sub_y": 6,
     "nx_intr": 48,
     "ny_intr": 48,
     "lx_sub": 0.5,
@@ -27,7 +27,7 @@
     "tol": 1e-8,
     "maxit": 10,
     "check_unique_models": true,
-    "nets_dir": "/p/lustre5/colekend/test_train_feb19_tmp5/run_noredist/nets",
+    "nets_dir": "/p/lustre5/colekend/ddrom_dist_scaling_may19/run_3by3_new2/nets",
     "nets_layout": "merged",
     "nets_tag": {
       "interior": "",

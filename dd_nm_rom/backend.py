@@ -1256,7 +1256,8 @@ def gatherv_tensor(
   as_list: bool = False,
   coalesce: bool = False,
   cache_key: Optional[Any] = None,
-  validate_cache: bool = False
+  validate_cache: bool = False,
+  async_op: bool = False
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
   """
   Gathers the local tensor x from each rank onto root rank.
@@ -1287,10 +1288,26 @@ def gatherv_tensor(
   :param validate_cache: Check whether a cached plan's local size changed on
     any rank. This is needed for dynamic sparse ``nnz`` sizes.
   :type validate_cache: bool
+  :param async_op: Post a nonblocking gather and return a ``GathervRequest``.
+    Call ``wait()`` on the request to obtain the normal result.
+  :type async_op: bool
 
   :return: Gathered data on root, or the local tensor on other ranks.
   :rtype: torch.Tensor or list[torch.Tensor]
   """
+  if async_op:
+    return igatherv_tensor(
+      x=x,
+      sizes=sizes,
+      offsets=offsets,
+      dim=dim,
+      root=root,
+      as_list=as_list,
+      coalesce=coalesce,
+      cache_key=cache_key,
+      validate_cache=validate_cache,
+    )
+
   if not distributed():
     return x
 
@@ -1362,114 +1379,25 @@ def gatherv_tensor(
     return gatherv_spcsr(x, sizes, offsets, dim, root, as_list,
                          cache_key=cache_key)
 
-  data = None
-  data_ptr = None
-
-  rank_sizes = sizes
-  rank_offsets = offsets
-  calc_sizes = False
-  cache_plan = None
-  if rank_sizes is None and cache_key is not None:
-    shape_key = tuple(x.shape[:dim] + x.shape[dim + 1:])
-    plan_key = (cache_key, dim, root, shape_key)
-    cache_plan = _GATHERV_PLAN_CACHE.get(plan_key)
-    if cache_plan is None:
-      rank_sizes = tuple(int(n) for n in _COMM.allgather(int(x.shape[dim])))
-      cache_plan = {
-        "local_size": int(x.shape[dim]),
-        "sizes": rank_sizes,
-      }
-      _GATHERV_PLAN_CACHE[plan_key] = cache_plan
-    else:
-      any_changed = False
-      if validate_cache:
-        changed = int(int(x.shape[dim]) != cache_plan["local_size"])
-        # All ranks must take the same cache/rebuild branch. Do not put the
-        # local size directly in plan_key because ranks may change sizes
-        # independently.
-        any_changed = bool(_COMM.allreduce(changed, op=MPI.MAX))
-      if any_changed:
-        rank_sizes = tuple(int(n) for n in _COMM.allgather(int(x.shape[dim])))
-        cache_plan = {
-          "local_size": int(x.shape[dim]),
-          "sizes": rank_sizes,
-        }
-        _GATHERV_PLAN_CACHE[plan_key] = cache_plan
-      else:
-        rank_sizes = cache_plan["sizes"]
-  elif rank_sizes is None:
-    # Preserve dynamic discovery for callers without a stable operation key.
-    # If rank sizes are undefined on root rank, determine the sizes before
-    # allocating the receive buffer.
-    calc_sizes = _RANK == root
-    calc_sizes = _COMM.bcast(calc_sizes, root=root)
-    barrier()
-    if calc_sizes:
-      rank_sizes = get_local_sizes(x, dim, root)
-
-  if _RANK == root:
-    total_size = list(x.shape)
-    total_size[dim] = np.sum(rank_sizes, dtype=int)
-    flat_total_size = np.prod(total_size, dtype=int)
-
-    if as_list:
-      rank_sizes_dim = rank_sizes
-
-    # scale rank_sizes by size of all other dimensions
-    other_dims = x.shape[dim+1:] + x.shape[:dim]
-
-    rank_sizes = [r * np.prod(other_dims, dtype=int) for r in rank_sizes]
-
-    if rank_offsets is None:
-      if cache_plan is not None and "offsets" in cache_plan:
-        rank_offsets = cache_plan["offsets"]
-      else:
-        rank_offsets  = [int(0)]
-        for rank in range(1, _NRANKS):
-          rank_offsets.append(rank_offsets[rank-1] + rank_sizes[rank-1])
-        if cache_plan is not None:
-          cache_plan["offsets"] = tuple(rank_offsets)
-
-    alloc_fn = torch.zeros if _USE_ZEROFILL else torch.empty
-    use_device_buffer = mpi_gpu_aware() and x.device.type == "cuda"
-    data = alloc_fn(
-      total_size,
-      dtype=x.dtype,
-      device=device() if use_device_buffer else "cpu",
-    )
-
-
-    rank_sizes = tuple(rank_sizes)
-    rank_offsets = tuple(rank_offsets)
-
-
-  dtype = MPI.Datatype.Match_size(MPI.TYPECLASS_REAL if x.is_floating_point() else MPI.TYPECLASS_INTEGER, x.element_size())
-
-  #assert x.storage_offset() == 0
-
-  # mpi4py requires contiguous buffers. Device-resident buffers are opt-in
-  # because GPU-aware MPI support is implementation-specific and can cause
-  # bus errors on systems without a validated CUDA/ROCm-aware MPI stack.
-  contiguous_x = _ensure_contiguous(x)
-  use_device_buffer = mpi_gpu_aware() and x.device.type == "cuda"
-  if use_device_buffer:
-    send_buffer = contiguous_x
-    recv_buffer = data if _RANK == root else None
-  else:
-    send_buffer = contiguous_x.detach().cpu().numpy()
-    recv_buffer = data.numpy() if _RANK == root else None
-  _COMM.Gatherv(send_buffer, [recv_buffer, rank_sizes, rank_offsets, dtype], root)
+  plan = _prepare_gatherv(
+    x, sizes, offsets, dim, root, cache_key, validate_cache
+  )
+  _COMM.Gatherv(
+    plan["send_buffer"],
+    [plan["recv_buffer"], plan["rank_sizes"], plan["rank_offsets"], plan["dtype"]],
+    root,
+  )
 
   #data = comm.gather(x, dim=dim, out=data)
   #tmp = comm.gather(x, dim=dim)
   #print(" GATHERV OUT: ", tmp)
 
   if _RANK == root and as_list:
-    data = data.to(device())
+    data = plan["data"].to(device())
     # Root rank stacks all gathered tensors
-    data = list(torch.split(data, rank_sizes_dim, dim=dim))
+    data = list(torch.split(data, plan["rank_sizes_dim"], dim=dim))
   if _RANK == root and not as_list:
-    data = data.to(device())
+    data = plan["data"].to(device())
 
   if x_sparse:
     # convert dense back to sparse
@@ -1487,6 +1415,274 @@ def gatherv_tensor(
     return data
   else:
     return x
+
+
+class GathervRequest:
+  """Handle for a nonblocking variable-size gather."""
+
+  def __init__(self, request=None, result=None, finish=None, keepalive=()):
+    self._request = request
+    self._result = result
+    self._finish = finish
+    self._keepalive = keepalive
+    self._complete = request is None
+
+  def wait(self):
+    if not self._complete:
+      self._request.Wait()
+      self._complete = True
+    if self._finish is not None:
+      finish = self._finish
+      self._finish = None
+      self._result = finish(self._result)
+    return self._result
+
+
+def _prepare_gatherv(
+  x,
+  sizes=None,
+  offsets=None,
+  dim=0,
+  root=0,
+  cache_key=None,
+  validate_cache=False,
+):
+  """Prepare common Gatherv metadata and buffers for blocking or async use."""
+  rank_sizes = sizes
+  rank_offsets = offsets
+  cache_plan = None
+  if rank_sizes is None and cache_key is not None:
+    shape_key = tuple(x.shape[:dim] + x.shape[dim + 1:])
+    plan_key = (cache_key, dim, root, shape_key)
+    cache_plan = _GATHERV_PLAN_CACHE.get(plan_key)
+    if cache_plan is None:
+      rank_sizes = tuple(int(n) for n in _COMM.allgather(int(x.shape[dim])))
+      cache_plan = {"local_size": int(x.shape[dim]), "sizes": rank_sizes}
+      _GATHERV_PLAN_CACHE[plan_key] = cache_plan
+    else:
+      any_changed = False
+      if validate_cache:
+        changed = int(int(x.shape[dim]) != cache_plan["local_size"])
+        # All ranks must take the same cache/rebuild branch.
+        any_changed = bool(_COMM.allreduce(changed, op=MPI.MAX))
+      if any_changed:
+        rank_sizes = tuple(int(n) for n in _COMM.allgather(int(x.shape[dim])))
+        cache_plan = {"local_size": int(x.shape[dim]), "sizes": rank_sizes}
+        _GATHERV_PLAN_CACHE[plan_key] = cache_plan
+      else:
+        rank_sizes = cache_plan["sizes"]
+  elif rank_sizes is None:
+    # Preserve dynamic discovery for callers without a stable operation key.
+    # If rank sizes are undefined on root rank, determine the sizes before
+    # allocating the receive buffer.
+    calc_sizes = _COMM.bcast(_RANK == root, root=root)
+    barrier()
+    if calc_sizes:
+      rank_sizes = get_local_sizes(x, dim, root)
+
+  data = None
+  rank_sizes_dim = rank_sizes
+  if _RANK == root:
+    total_size = list(x.shape)
+    total_size[dim] = np.sum(rank_sizes, dtype=int)
+    other_dims = x.shape[dim+1:] + x.shape[:dim]
+    rank_sizes = [r * np.prod(other_dims, dtype=int) for r in rank_sizes]
+    if rank_offsets is None:
+      if cache_plan is not None and "offsets" in cache_plan:
+        rank_offsets = cache_plan["offsets"]
+      else:
+        rank_offsets = [0]
+        for rank in range(1, _NRANKS):
+          rank_offsets.append(rank_offsets[-1] + rank_sizes[rank-1])
+        if cache_plan is not None:
+          cache_plan["offsets"] = tuple(rank_offsets)
+    alloc_fn = torch.zeros if _USE_ZEROFILL else torch.empty
+    use_device_buffer = mpi_gpu_aware() and x.device.type == "cuda"
+    data = alloc_fn(
+      total_size,
+      dtype=x.dtype,
+      device=device() if use_device_buffer else "cpu",
+    )
+    rank_sizes = tuple(rank_sizes)
+    rank_offsets = tuple(rank_offsets)
+
+  dtype = MPI.Datatype.Match_size(
+    MPI.TYPECLASS_REAL if x.is_floating_point() else MPI.TYPECLASS_INTEGER,
+    x.element_size(),
+  )
+  contiguous_x = _ensure_contiguous(x)
+  use_device_buffer = mpi_gpu_aware() and x.device.type == "cuda"
+  if use_device_buffer:
+    send_buffer = contiguous_x
+    recv_buffer = data if _RANK == root else None
+  else:
+    send_buffer = contiguous_x.detach().cpu().numpy()
+    recv_buffer = data.numpy() if _RANK == root else None
+
+  return {
+    "data": data,
+    "rank_sizes": rank_sizes,
+    "rank_offsets": rank_offsets,
+    "rank_sizes_dim": rank_sizes_dim,
+    "dtype": dtype,
+    "send_buffer": send_buffer,
+    "recv_buffer": recv_buffer,
+    "keepalive": (x, contiguous_x, send_buffer, data),
+  }
+
+
+def _igatherv_dense(
+  x: torch.Tensor,
+  sizes=None,
+  offsets=None,
+  dim=0,
+  root=0,
+  as_list=False,
+  cache_key=None,
+  validate_cache=False,
+):
+  """Post a dense nonblocking Gatherv and defer device/list processing."""
+  if not distributed():
+    return GathervRequest(result=x)
+
+  plan = _prepare_gatherv(
+    x, sizes, offsets, dim, root, cache_key, validate_cache
+  )
+  request = _COMM.Igatherv(
+    plan["send_buffer"],
+    [plan["recv_buffer"], plan["rank_sizes"], plan["rank_offsets"], plan["dtype"]],
+    root,
+  )
+
+  def finish(gathered):
+    if _RANK != root:
+      return x
+    gathered = gathered.to(device())
+    if as_list:
+      return list(torch.split(gathered, plan["rank_sizes_dim"], dim=dim))
+    return gathered
+
+  return GathervRequest(
+    request=request,
+    result=plan["data"],
+    finish=finish,
+    keepalive=plan["keepalive"],
+  )
+
+
+def igatherv_tensor(
+  x,
+  sizes=None,
+  offsets=None,
+  dim=0,
+  root=0,
+  as_list=False,
+  coalesce=False,
+  cache_key=None,
+  validate_cache=False,
+):
+  """Post a nonblocking gather; call ``wait()`` for the normal result."""
+  if isinstance(x, List):
+    sparse_csr = any(t.is_sparse_csr for t in x)
+    if sparse_csr:
+      x = [t.to_sparse_coo() if t.is_sparse_csr else t for t in x]
+    sub_sizes = tuple(int(t.shape[dim]) for t in x)
+    packed = torch.cat(x, dim=dim)
+    all_sub_sizes = None
+    if as_list:
+      if cache_key is None:
+        all_sub_sizes = _COMM.gather(sub_sizes, root=root)
+      else:
+        list_shape_key = tuple(packed.shape[:dim] + packed.shape[dim + 1:])
+        list_plan_key = (cache_key, dim, root, list_shape_key)
+        list_plan = _GATHERV_LIST_PLAN_CACHE.get(list_plan_key)
+        if list_plan is None:
+          all_sub_sizes = tuple(_COMM.allgather(sub_sizes))
+          list_plan = {
+            "local_sub_sizes": sub_sizes,
+            "all_sub_sizes": all_sub_sizes,
+          }
+          _GATHERV_LIST_PLAN_CACHE[list_plan_key] = list_plan
+        else:
+          any_changed = False
+          if validate_cache:
+            any_changed = bool(_COMM.allreduce(
+              int(sub_sizes != list_plan["local_sub_sizes"]), op=MPI.MAX
+            ))
+          if any_changed:
+            all_sub_sizes = tuple(_COMM.allgather(sub_sizes))
+            list_plan = {
+              "local_sub_sizes": sub_sizes,
+              "all_sub_sizes": all_sub_sizes,
+            }
+            _GATHERV_LIST_PLAN_CACHE[list_plan_key] = list_plan
+          else:
+            all_sub_sizes = list_plan["all_sub_sizes"]
+    request = _igatherv_dense(
+      packed, sizes, offsets, dim, root, as_list,
+      cache_key=cache_key, validate_cache=validate_cache,
+    )
+
+    def finish(gathered):
+      if _RANK != root or not as_list:
+        return gathered.to_sparse_csr() if sparse_csr and _RANK == root else gathered
+      # List ordering is rank order, then the original local subdomain order.
+      result = [list(torch.split(t, all_sub_sizes[r], dim))
+                for r, t in enumerate(gathered)]
+      return [t.to_sparse_csr() for t in result] if sparse_csr else result
+
+    request._finish = finish
+    return request
+
+  if x.is_sparse:
+    if coalesce:
+      x = x.coalesce()
+    indices = igatherv_tensor(
+      x._indices().ravel(), sizes, offsets, 0, root, True,
+      cache_key=(cache_key, "indices"), validate_cache=True,
+    )
+    values = igatherv_tensor(
+      x._values(), sizes, offsets, 0, root, True,
+      cache_key=(cache_key, "values"), validate_cache=True,
+    )
+    shapes = _COMM.gather(x.shape)
+    def finish_sparse(_):
+      if _RANK != root:
+        indices.wait(); values.wait()
+        return x
+      gathered_indices = indices.wait()
+      gathered_values = values.wait()
+      result = [torch.sparse_coo_tensor(
+        gathered_indices[r].reshape(x.ndim, -1), gathered_values[r],
+        size=shapes[r], device=device()
+      ) for r in range(_NRANKS)]
+      return torch.cat(result, dim=dim) if not as_list else result
+    return GathervRequest(finish=finish_sparse)
+
+  if x.is_sparse_csr:
+    components = [x.crow_indices(), x.col_indices(), x.values()]
+    names = ["crow_indices", "col_indices", "values"]
+    requests = [igatherv_tensor(
+      component, sizes, offsets, 0, root, True,
+      cache_key=(cache_key, name), validate_cache=True,
+    ) for component, name in zip(components, names)]
+    shapes = _COMM.gather(x.shape)
+    def finish_sparse_csr(_):
+      gathered = [request.wait() for request in requests]
+      if _RANK != root:
+        return x
+      result = [torch.sparse_csr_tensor(
+        gathered[0][r], gathered[1][r], gathered[2][r],
+        size=shapes[r], device=device()
+      ) for r in range(_NRANKS)]
+      return (torch.cat([t.to_sparse_coo() for t in result], dim=dim)
+              .to_sparse_csr() if not as_list else result)
+    return GathervRequest(finish=finish_sparse_csr)
+
+  return _igatherv_dense(
+    x, sizes, offsets, dim, root, as_list,
+    cache_key=cache_key, validate_cache=validate_cache,
+  )
 
 
 def gatherv_spcoo(

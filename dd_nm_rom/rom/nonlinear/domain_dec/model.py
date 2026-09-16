@@ -799,13 +799,19 @@ class DD_NM_ROM(object):
     if bkd.distributed():
       if use_global:
         dist.reduce(cres, dst=0, op=dist.ReduceOp.SUM)
-        global_res = [bkd.gatherv_tensor(r, as_list=True, cache_key=("rom-residual", i))
-                      for i, r in enumerate(res)]
-        global_cjac = [bkd.gatherv_tensor(r, dim=1, as_list=True, coalesce=True,
-                                          cache_key=("rom-cjac", i))
-                       for i, r in enumerate(cjac)]
-        global_hess = [bkd.gatherv_tensor(r, as_list=True, cache_key=("rom-hess", i))
-                       for i, r in enumerate(hess)]
+        res_requests = [bkd.gatherv_tensor(
+          r, as_list=True, cache_key=("rom-residual", i), async_op=True)
+          for i, r in enumerate(res)]
+        cjac_requests = [bkd.gatherv_tensor(
+          r, dim=1, as_list=True, coalesce=True,
+          cache_key=("rom-cjac", i), async_op=True)
+          for i, r in enumerate(cjac)]
+        hess_requests = [bkd.gatherv_tensor(
+          r, as_list=True, cache_key=("rom-hess", i), async_op=True)
+          for i, r in enumerate(hess)]
+        global_res = [request.wait() for request in res_requests]
+        global_cjac = [request.wait() for request in cjac_requests]
+        global_hess = [request.wait() for request in hess_requests]
 
         bkd.barrier()
 

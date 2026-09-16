@@ -468,14 +468,19 @@ class DDBurgers2D(object):
 
     if bkd.distributed():
       if use_global:
-        # TODO: [0] below indicates # of subdomains per rank, fix this to generalize
-        global_res = [bkd.gatherv_tensor(r, as_list=True, cache_key=("fom-residual", i))
-                      for i, r in enumerate(res)]
-        global_cjac = [bkd.gatherv_tensor(r, dim=1, as_list=True, coalesce=True,
-                                          cache_key=("fom-cjac", i))
-                       for i, r in enumerate(cjac)]
-        global_hess = [bkd.gatherv_tensor(r, as_list=True, cache_key=("fom-hess", i))
-                       for i, r in enumerate(hess)]
+        res_requests = [bkd.gatherv_tensor(
+          r, as_list=True, cache_key=("fom-residual", i), async_op=True)
+          for i, r in enumerate(res)]
+        cjac_requests = [bkd.gatherv_tensor(
+          r, dim=1, as_list=True, coalesce=True,
+          cache_key=("fom-cjac", i), async_op=True)
+          for i, r in enumerate(cjac)]
+        hess_requests = [bkd.gatherv_tensor(
+          r, as_list=True, cache_key=("fom-hess", i), async_op=True)
+          for i, r in enumerate(hess)]
+        global_res = [request.wait() for request in res_requests]
+        global_cjac = [request.wait() for request in cjac_requests]
+        global_hess = [request.wait() for request in hess_requests]
 
         
         dist.reduce(cres, dst=0, op=dist.ReduceOp.SUM)

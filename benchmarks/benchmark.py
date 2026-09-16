@@ -226,6 +226,9 @@ def _run_worker(spec: dict[str, Any], backend: str, rank_count: int) -> dict[str
     seed = spec.get("seed", config.get("seed"))
     device = "cuda" if backend == "torch_gpu" else "cpu"
     bkd = _configure_backend(backend, threads, seed)
+    from dd_nm_rom import config as ddnmrom_config
+
+    configuration = ddnmrom_config.get_config_snapshot()
 
     try:
         rank = bkd.get_rank()
@@ -259,6 +262,7 @@ def _run_worker(spec: dict[str, Any], backend: str, rank_count: int) -> dict[str
             "ranks": bkd.get_nranks(),
             "timings_seconds": timings,
             "metrics": last_metrics if isinstance(last_metrics, dict) else {},
+            "configuration": configuration,
         }
         if bkd.get_nranks() > 1:
             records = bkd._COMM.gather(record, root=0)
@@ -270,6 +274,11 @@ def _run_worker(spec: dict[str, Any], backend: str, rank_count: int) -> dict[str
         all_times = [value for item in records for value in item["timings_seconds"]]
         critical_path = [max(item["timings_seconds"][i] for item in records)
                          for i in range(repetitions)]
+        configurations = [item["configuration"] for item in records]
+        configuration_consistent = all(
+            item == configurations[0] for item in configurations[1:]
+        )
+        result_configuration = configurations[0]
         return {
             "backend": backend,
             "device": device,
@@ -282,6 +291,8 @@ def _run_worker(spec: dict[str, Any], backend: str, rank_count: int) -> dict[str
             },
             "hostname": socket.gethostname(),
             "python": sys.executable,
+            "configuration": result_configuration,
+            "configuration_consistent_across_ranks": configuration_consistent,
             "timings_seconds": critical_path,
             "summary": {
                 "min": min(all_times),
@@ -291,6 +302,9 @@ def _run_worker(spec: dict[str, Any], backend: str, rank_count: int) -> dict[str
             },
             "solver_metrics": records[0].get("metrics", {}),
             "rank_records": records,
+            **({} if configuration_consistent else {
+                "configuration_by_rank": configurations,
+            }),
         }
     finally:
         if backend != "numpy":

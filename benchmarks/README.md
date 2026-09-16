@@ -67,6 +67,13 @@ matching file exists. Profiles only load modules and export runtime settings;
 the benchmark is still launched once per Flux task. The default worker
 interpreter is `.venv/bin/python` and can be replaced with `--python`.
 
+Benchmark result records include a `configuration` section containing every
+registered `DDNMROM_*` option, its effective value, default, and whether it
+came from the environment. Unregistered `DDNMROM_*` variables are included
+under `extra_environment`; a stable configuration fingerprint is also
+recorded. Parallel results report whether the configuration was consistent
+across ranks.
+
 Project DD-FOM/DD-ROM workloads can be added as separate modules using the
 same protocol. This keeps benchmark timing independent of pytest setup,
 assertions, and profiler output. The rank count must divide the workload's

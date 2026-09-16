@@ -95,6 +95,31 @@ under `extra_environment`; a stable configuration fingerprint is also
 recorded. Parallel results report whether the configuration was consistent
 across ranks.
 
+Summarizing and plotting results
+--------------------------------
+
+`analyze.py` converts result JSON files into readable CSV, Markdown, or JSON
+tables and can generate noninteractive PNG/PDF plots. Strong scaling uses
+rank count on the x-axis; weak scaling uses total subdomains. The same tool
+works for DD-FOM/DD-ROM and backend workload results:
+
+```text
+.venv/bin/python benchmarks/analyze.py summarize \
+  --input-dir benchmark_jobs/flux \
+  --output benchmark_results/scaling.csv \
+  --format markdown --study strong
+
+.venv/bin/python benchmarks/analyze.py plot \
+  --table benchmark_results/scaling.csv \
+  --output-dir benchmark_results/plots \
+  --study strong --format png,pdf
+```
+
+Use repeated `--y` options for `speedup`, `efficiency`, or a solver metric,
+for example `--y metric:newton_iterations`. Specs can declare
+`"analysis": {"study": "strong"}` or `"weak"` to make the scaling mode
+explicit.
+
 Project DD-FOM/DD-ROM workloads can be added as separate modules using the
 same protocol. This keeps benchmark timing independent of pytest setup,
 assertions, and profiler output. The rank count must divide the workload's

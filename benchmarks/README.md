@@ -67,6 +67,27 @@ matching file exists. Profiles only load modules and export runtime settings;
 the benchmark is still launched once per Flux task. The default worker
 interpreter is `.venv/bin/python` and can be replaced with `--python`.
 
+When already inside an allocation, use the local scheduler mode with the
+allocation's task launcher. `auto` detects Flux or Slurm and otherwise retains
+the traditional `mpiexec` behavior:
+
+```text
+# Inside Flux
+.venv/bin/python benchmarks/benchmark.py \
+  --spec benchmarks/specs/dd_fom_steady.json --backend torch_gpu \
+  --launcher local --local-launcher flux --ranks 1,2,4
+
+# Inside Slurm
+.venv/bin/python benchmarks/benchmark.py \
+  --spec benchmarks/specs/dd_fom_steady.json --backend torch_gpu \
+  --launcher local --local-launcher srun --ranks 1,2,4
+```
+
+Use `--local-launcher mpiexec` to force the existing MPI launcher, or leave
+the option at `auto` to select Flux, Slurm, or `mpiexec` from the allocation
+environment. Any selected environment profile is sourced before the local
+task launcher runs.
+
 Benchmark result records include a `configuration` section containing every
 registered `DDNMROM_*` option, its effective value, default, and whether it
 came from the environment. Unregistered `DDNMROM_*` variables are included

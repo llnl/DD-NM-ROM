@@ -357,15 +357,73 @@ def _resolve_env_profile(configured: Path | None) -> Path | None:
             raise ValueError(f"benchmark environment profile does not exist: {profile}")
         return profile
 
+    system_type = os.environ.get("SYS_TYPE")
     system_name = {
         "toss_4_x86_64_ib": "toss",
         "toss_4_x86_64_ib_cray": "tuo",
         "blueos_3_ppc64le_ib_p9": "coral",
-    }.get(os.environ.get("SYS_TYPE"))
+        "matrix": "matrix",
+    }.get(system_type)
+    if system_name is None and system_type:
+        system_name = system_type
     if system_name is None:
         return None
     profile = ENV_PROFILE_DIR / f"{system_name}.bash"
     return profile if profile.is_file() else None
+
+
+def _detect_local_launcher() -> str:
+    """Detect the task launcher provided by the current allocation."""
+    if any(os.environ.get(name) for name in ("FLUX_URI", "FLUX_JOB_ID", "FLUX_JOB_SIZE")):
+        return "flux"
+    if os.environ.get("SLURM_JOB_ID"):
+        return "srun"
+    return "mpiexec"
+
+
+def _select_local_launcher(requested: str) -> str:
+    launcher = _detect_local_launcher() if requested == "auto" else requested
+    if requested != "auto":
+        allocation_vars = {
+            "flux": ("FLUX_URI", "FLUX_JOB_ID", "FLUX_JOB_SIZE"),
+            "srun": ("SLURM_JOB_ID",),
+        }.get(launcher)
+        if allocation_vars and not any(os.environ.get(name) for name in allocation_vars):
+            allocation = "Flux" if launcher == "flux" else "Slurm"
+            raise ValueError(
+                f"--local-launcher {launcher} requires an active {allocation} allocation"
+            )
+    return launcher
+
+
+def _local_task_command(args: argparse.Namespace, launcher: str, rank: int) -> list[str]:
+    """Build a task-launch command for an existing local allocation."""
+    if launcher == "flux":
+        return [
+            "flux", "run", "-n", str(rank), "-g", "1", "-c", "1",
+            "-vvv", "--setopt=mpibind=verbose:1",
+        ]
+    if launcher == "srun":
+        command = ["srun", "-n", str(rank)]
+        if args.cpus_per_task:
+            command += ["--cpus-per-task", str(args.cpus_per_task)]
+        if args.gpus_per_task:
+            command += ["--gpus-per-task", str(args.gpus_per_task), "--gpu-bind=closest"]
+        return command
+    if launcher == "mpiexec":
+        return shlex.split(args.mpi_launcher.format(ranks=rank))
+    raise ValueError(f"unsupported local launcher: {launcher}")
+
+
+def _wrap_with_env_profile(command: list[str], profile: Path | None) -> list[str]:
+    """Source a profile before running a command in a child shell."""
+    if profile is None:
+        return command
+    command_text = " ".join(shlex.quote(value) for value in command)
+    return [
+        "bash", "-lc",
+        f"source {shlex.quote(str(profile))}\nexec {command_text}",
+    ]
 
 
 def _scheduler_script(
@@ -469,6 +527,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", choices=BACKENDS, default="torch_cpu")
     parser.add_argument("--ranks", type=_parse_ranks, default=[1])
     parser.add_argument("--launcher", choices=LAUNCHERS, default="local")
+    parser.add_argument(
+        "--local-launcher",
+        choices=("auto", "mpiexec", "flux", "srun"),
+        default="auto",
+        help="Task launcher for --launcher local (default: auto-detect allocation)",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("benchmark_jobs"))
     parser.add_argument("--submit", action="store_true", help="Submit generated scheduler scripts")
@@ -551,12 +615,14 @@ def main(argv: list[str] | None = None) -> int:
     total_jobs = sum(len(case[2]) for case in prepared_cases)
 
     if args.launcher == "local":
+        local_launcher = _select_local_launcher(args.local_launcher)
+        env_profile = _resolve_env_profile(args.env_profile)
         for case_name, effective_spec, ranks, overrides in prepared_cases:
             for rank in ranks:
                 output = _result_path(
                     args, args.spec, effective_spec, case_name, rank, total_jobs
                 )
-                if rank == 1:
+                if rank == 1 and local_launcher == "mpiexec":
                     result = _run_worker(effective_spec, args.backend, 1)
                     if result is not None:
                         if output:
@@ -564,11 +630,12 @@ def main(argv: list[str] | None = None) -> int:
                         print(json.dumps(result, indent=2, default=str))
                     continue
 
-                command = args.mpi_launcher.format(ranks=rank)
-                command = shlex.split(command) + _base_command(
+                command = _local_task_command(args, local_launcher, rank)
+                command += _base_command(
                     args, args.spec, rank, output,
                     case_name=case_name, overrides=overrides,
                 )
+                command = _wrap_with_env_profile(command, env_profile)
                 subprocess.run(command, check=True)
         return 0
 

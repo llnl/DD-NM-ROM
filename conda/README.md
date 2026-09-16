@@ -105,3 +105,58 @@ flux run -N 1 -x -n 4 -g 1 -c 1 -vvv --setopt=mpibind=verbose:1 python -u -m pyt
 ```
 
 The `--backend=` flag can be used to select `numpy`, `torch_cpu` or `torch_gpu`.
+
+
+# For Matrix:
+---
+
+The following example creates a CUDA-enabled Python environment on Matrix:
+
+```
+module load python/3.12.2 cuda/12.9.1
+
+python3 -m venv /path/to/venv
+
+source /path/to/venv/bin/activate
+
+pip install torch==2.10.0+cu129 --index-url https://download.pytorch.org/whl/cu129
+
+pip install -r requirements.txt
+
+CC=mpicc pip install --verbose --no-cache-dir --no-binary=mpi4py mpi4py
+
+pip install nvmath-python[cu12,dx]==0.6.0 'nvidia-cuda-nvcc-cu12==12.9.86' 'nvidia-cuda-nvrtc-cu12==12.9.86' --extra-index-url https://download.pytorch.org/whl/cu129 torch==2.10.0+cu129
+```
+
+**Running with Slurm**
+
+- Request an allocation using your LC bank:
+
+```
+salloc -N 1 -A <BANK> -t 60 -p pdebug --exclusive
+```
+
+- Load the environment:
+
+```
+module load python/3.12.2 cuda/12.9.1
+
+source /path/to/venv/bin/activate
+```
+
+- For serial runs with CPU/numpy backend, the Python or pytest executable can
+  be used directly.
+
+- For parallel runs, invoke using `srun`. For example, a 4-rank run:
+
+```
+srun -N 1 -n 4 --gpus-per-task=1 --gpu-bind=closest python path/to/script.py
+```
+
+- For parallel unit tests:
+
+```
+srun -N 1 -n 4 --gpus-per-task=1 --gpu-bind=closest python -u -m pytest --verbose -s -x --with-mpi tests/
+```
+
+The `--backend=` flag can be used to select `numpy`, `torch_cpu` or `torch_gpu`.

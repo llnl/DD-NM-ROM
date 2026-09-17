@@ -290,13 +290,17 @@ class Solver(object):
 
 
     if bkd.distributed() and not use_global:
-      global_res = bkd.gatherv_tensor(res, as_list=True)
+      global_res = bkd.gatherv_tensor(res, as_list=True, cache_key="solver-residual")
 
       cres = jac[0]
       dist.reduce(cres, dst=0, op=dist.ReduceOp.SUM)
 
-      global_cjac = [bkd.gatherv_tensor(r, dim=1, as_list=True, coalesce=True) for r in jac[1]]
-      global_hess = [bkd.gatherv_tensor(r, as_list=True) for r in jac[2]]
+      global_cjac = [bkd.gatherv_tensor(r, dim=1, as_list=True, coalesce=True,
+                                        cache_key=("solver-cjac", i))
+                     for i, r in enumerate(jac[1])]
+      global_hess = [bkd.gatherv_tensor(r, as_list=True,
+                                        cache_key=("solver-hess", i))
+                     for i, r in enumerate(jac[2])]
       global_jac = None
       if bkd.root():
         global_cjac = self.model.flatten_across_domain(global_cjac)

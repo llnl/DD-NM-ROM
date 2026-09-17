@@ -153,7 +153,7 @@ class DistNewton(Solver):
     """
     if not isinstance(dx, DTensor):
       return dx
-    direction = bkd.gatherv_tensor(dx.to_local())
+    direction = bkd.gatherv_tensor(dx.to_local(), cache_key="newton-direction")
     return bkd.broadcast_tensor(direction, root=0)
 
   def _global_kkt_norm(self, res, cres):
@@ -453,7 +453,7 @@ class DistNewton(Solver):
       if self.debug: logger.debug(" DONE LINE SEARCH")
       if self.debug: logger.debug(" CRES SHAPE {} RES SHAPE = {}".format(cres.shape, res.shape))
       res_local = res.to_local() if isinstance(res, DTensor) else res
-      res_full = bkd.gatherv_tensor(res_local)
+      res_full = bkd.gatherv_tensor(res_local, cache_key="newton-residual")
       res_full = bkd.broadcast_tensor(res_full)
       res_full = torch.cat((res_full, cres))
 

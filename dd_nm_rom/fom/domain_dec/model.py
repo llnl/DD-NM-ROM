@@ -368,7 +368,8 @@ class DDBurgers2D(object):
     bkd.barrier()
     if bkd.distributed():
       if use_global:
-        global_res = [bkd.gatherv_tensor(r, as_list=True) for r in res]
+        global_res = [bkd.gatherv_tensor(r, as_list=True, cache_key=("fom-residual", i))
+                      for i, r in enumerate(res)]
         dist.reduce(cres, dst=0, op=dist.ReduceOp.SUM)
         if bkd.root():
           res = self.flatten_across_domain(global_res)
@@ -467,10 +468,19 @@ class DDBurgers2D(object):
 
     if bkd.distributed():
       if use_global:
-        # TODO: [0] below indicates # of subdomains per rank, fix this to generalize
-        global_res = [bkd.gatherv_tensor(r, as_list=True) for r in res]
-        global_cjac = [bkd.gatherv_tensor(r, dim=1, as_list=True, coalesce=True) for r in cjac]
-        global_hess = [bkd.gatherv_tensor(r, as_list=True) for r in hess]
+        res_requests = [bkd.gatherv_tensor(
+          r, as_list=True, cache_key=("fom-residual", i), async_op=True)
+          for i, r in enumerate(res)]
+        cjac_requests = [bkd.gatherv_tensor(
+          r, dim=1, as_list=True, coalesce=True,
+          cache_key=("fom-cjac", i), async_op=True)
+          for i, r in enumerate(cjac)]
+        hess_requests = [bkd.gatherv_tensor(
+          r, as_list=True, cache_key=("fom-hess", i), async_op=True)
+          for i, r in enumerate(hess)]
+        global_res = [request.wait() for request in res_requests]
+        global_cjac = [request.wait() for request in cjac_requests]
+        global_hess = [request.wait() for request in hess_requests]
 
         
         dist.reduce(cres, dst=0, op=dist.ReduceOp.SUM)
@@ -546,7 +556,11 @@ class DDBurgers2D(object):
       for e_k in ("interior", "interface"):
         uv_global[e_k] = {}
         for x_k in ("u", "v"):
-          uv_global[e_k][x_k] = [bkd.gatherv_tensor(s, as_list=True) for s in uv[e_k][x_k]]
+          uv_global[e_k][x_k] = [
+            bkd.gatherv_tensor(s, as_list=True,
+                               cache_key=("fom-state", e_k, x_k, i))
+            for i, s in enumerate(uv[e_k][x_k])
+          ]
       if map_on_res:
         uv_global["res"] = {}
         uv_global["res"]["u"] = None
@@ -754,7 +768,11 @@ class DDBurgers2D(object):
     for e_k in ("interior", "interface"):
       # TODO: [0] below indicates # of subdomains per rank, fix this to generalize
       # todo: change to cat? bcast? 4/24
-      x_g[e_k] = [bkd.gatherv_tensor(s, dim=1, as_list=True) for s in x[e_k]]
+      x_g[e_k] = [
+        bkd.gatherv_tensor(s, dim=1, as_list=True,
+                           cache_key=("fom-init", e_k, i))
+        for i, s in enumerate(x[e_k])
+      ]
 
     # broadcast collected subdomain states
 

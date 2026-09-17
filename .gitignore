@@ -10,3 +10,6 @@ venv_path.txt*
 build/
 
 **spindle_bootstrap**
+
+# Exclude any benchmarking results
+benchmark_results/

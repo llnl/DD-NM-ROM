@@ -1,0 +1,32 @@
+{
+  "name": "dd_fom_unsteady",
+  "target": "benchmarks.workloads_dd:dd_fom_unsteady",
+  "warmups": 0,
+  "repetitions": 1,
+  "threads": 8,
+  "config": {
+    "n_sub_x": 4,
+    "n_sub_y": 4,
+    "nx_intr": 48,
+    "ny_intr": 48,
+    "lx_sub": 0.5,
+    "ly_sub": 0.5,
+    "x0": 0.0,
+    "y0": 0.0,
+    "with_bounds": true,
+    "viscosity": 0.001,
+    "field": "SinPeak",
+    "mu_lim": [0.9, 1.1],
+    "bc_type": "periodic",
+    "dt": 0.03,
+    "nt": 1,
+    "steady": false,
+    "constraint_type": "strong",
+    "tol": 1e-8,
+    "maxit": 20,
+    "stepsize_min": 1e-10,
+    "verbose": false,
+    "measure": "dd_fom",
+    "include_monolithic_reference": false
+  }
+}

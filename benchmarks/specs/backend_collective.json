@@ -1,0 +1,23 @@
+{
+  "name": "backend_collective",
+  "target": "benchmarks.workloads_backend:backend_collective",
+  "warmups": 1,
+  "repetitions": 3,
+  "threads": 1,
+  "sweep": {
+    "config.operation": [
+      "barrier",
+      "bcast",
+      "get_local_sizes_all",
+      "gather_tensor",
+      "gatherv_tensor",
+      "scatter_tensor",
+      "broadcast_tensor"
+    ]
+  },
+  "config": {
+    "rows": 256,
+    "cols": 256,
+    "seed": 0
+  }
+}

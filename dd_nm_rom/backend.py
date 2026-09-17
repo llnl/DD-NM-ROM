@@ -464,7 +464,9 @@ def speye(
     shape = (n, n)
     diag = n
   global _FLOATX
-  data = torch.ones(diag, layout=torch.strided, dtype=_FLOATX, device=device())
+  # `_FLOATX` stores the public string name (for example, ``"float64"``),
+  # while torch constructors require the corresponding torch.dtype object.
+  data = torch.ones(diag, layout=torch.strided, dtype=floatx("torch"), device=device())
   if format=="coo":
     indices = torch.arange(0, diag, dtype=int, device=device())
     return torch.sparse_coo_tensor(torch.vstack((indices, indices)), data, size=shape, device=device())

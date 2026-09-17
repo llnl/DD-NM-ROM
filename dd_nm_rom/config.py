@@ -1,4 +1,6 @@
 import logging
+import hashlib
+import json
 import os
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,52 @@ _env_vars = {
   "DDNMROM_MPI_BUFFER_ZEROFILL": _DDNMROM_BACKEND_MPI_FILLZERO, # whether to create communication buffers always filled with zero, or empty memory
   "DDNMROM_MPI_GPU_AWARE": _DDNMROM_BACKEND_MPI_GPU_AWARE, # enable device-resident mpi4py buffers (requires validated GPU-aware MPI)
   "DDNMROM_DTENSOR_CHECKS": _DDNMROM_BACKEND_DTENSOR_CHECKS, # enable torch.DTensor shape checks on creation (adds overhead)
+  }
+
+
+def _convert_env_value(value, default):
+  """Convert an environment value using the registered default's type."""
+  if isinstance(default, bool):
+    return value.lower() in ("1", "true", "yes", "on")
+  return type(default)(value)
+
+
+def get_config_snapshot():
+  """Return effective DDNM-ROM environment configuration and provenance.
+
+  Registered options are reported even when unset, using their configured
+  defaults.  Additional ``DDNMROM_*`` variables are retained under
+  ``extra_environment`` so benchmark metadata also captures runner- or
+  site-specific settings that are not library configuration options.
+  """
+  registered = {}
+  effective = {}
+  for var, default in _env_vars.items():
+    raw_value = os.getenv(var)
+    if raw_value is None:
+      value = default
+      source = "default"
+    else:
+      value = _convert_env_value(raw_value, default)
+      source = "environment"
+    registered[var] = {
+      "value": value,
+      "source": source,
+      "default": default,
+      "environment": raw_value,
+    }
+    effective[var] = value
+
+  extras = {
+    var: value for var, value in os.environ.items()
+    if var.startswith("DDNMROM_") and var not in _env_vars
+  }
+  encoded = json.dumps(effective, sort_keys=True, separators=(",", ":"))
+  fingerprint = "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+  return {
+    "registered": registered,
+    "extra_environment": extras,
+    "fingerprint": fingerprint,
   }
 
 

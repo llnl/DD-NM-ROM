@@ -1,0 +1,32 @@
+#!/bin/bash
+# Tuolumne environment for benchmark scheduler jobs.
+# Override ROCM_VERSION and MPICH_VERSION before submission when needed.
+
+: "${ROCM_VERSION:=7.2.1}"
+: "${MPICH_VERSION:=9.1.0}"
+
+module load PrgEnv-gnu gcc-native/11.2 \
+  "cray-mpich/${MPICH_VERSION}" "rocm/${ROCM_VERSION}"
+
+export TENSILE_SOLUTION_SELECTION_METHOD="${TENSILE_SOLUTION_SELECTION_METHOD:-2}"
+export FI_MR_CACHE_MONITOR="${FI_MR_CACHE_MONITOR:-kdreg2}"
+export MIOPEN_DISABLE_CACHE="${MIOPEN_DISABLE_CACHE:-0}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export LD_LIBRARY_PATH="/opt/rocm-${ROCM_VERSION}/llvm/lib:${LD_LIBRARY_PATH:-}"
+export FI_CXI_RDZV_PROTO="${FI_CXI_RDZV_PROTO:-alt_read}"
+export FI_CXI_RDZV_THRESHOLD="${FI_CXI_RDZV_THRESHOLD:-0}"
+export FI_CXI_RDZV_GET_MIN="${FI_CXI_RDZV_GET_MIN:-0}"
+export FI_CXI_RDZV_EAGER_SIZE="${FI_CXI_RDZV_EAGER_SIZE:-0}"
+export FI_CXI_DEFAULT_TX_SIZE="${FI_CXI_DEFAULT_TX_SIZE:-1024}"
+export FI_CXI_DISABLE_HOST_REGISTER="${FI_CXI_DISABLE_HOST_REGISTER:-1}"
+export FI_CXI_DEFAULT_CQ_SIZE="${FI_CXI_DEFAULT_CQ_SIZE:-131072}"
+export FI_CXI_RX_MATCH_MODE="${FI_CXI_RX_MATCH_MODE:-hybrid}"
+export NCCL_CROSS_NIC="${NCCL_CROSS_NIC:-1}"
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-hsi0}"
+export PYTORCH_MIOPEN_SUGGEST_NHWC="${PYTORCH_MIOPEN_SUGGEST_NHWC:-1}"
+
+# Set this only when the site provides the matching RCCL network plugin.
+if [[ -n "${RCCL_PLUGIN_PREFIX:-}" ]]; then
+  export LD_LIBRARY_PATH="${RCCL_PLUGIN_PREFIX}/install/lib:${LD_LIBRARY_PATH}"
+fi

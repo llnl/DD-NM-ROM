@@ -1,0 +1,13 @@
+{
+  "name": "backend_dense_linear",
+  "target": "benchmarks.workloads_backend:backend_dense_linear",
+  "warmups": 2,
+  "repetitions": 5,
+  "threads": 1,
+  "config": {
+    "rows": 1024,
+    "inner": 1024,
+    "cols": 1024,
+    "seed": 0
+  }
+}

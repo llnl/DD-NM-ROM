@@ -1,0 +1,12 @@
+{
+  "name": "backend_sparse_linear",
+  "target": "benchmarks.workloads_backend:backend_sparse_linear",
+  "warmups": 2,
+  "repetitions": 5,
+  "threads": 1,
+  "config": {
+    "size": 4096,
+    "diagonals": 5,
+    "seed": 0
+  }
+}

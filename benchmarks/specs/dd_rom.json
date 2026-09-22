@@ -1,0 +1,38 @@
+{
+  "name": "dd_rom",
+  "target": "benchmarks.workloads_dd:dd_rom",
+  "warmups": 0,
+  "repetitions": 1,
+  "threads": 8,
+  "config": {
+    "n_sub_x": 6,
+    "n_sub_y": 6,
+    "nx_intr": 48,
+    "ny_intr": 48,
+    "lx_sub": 0.5,
+    "ly_sub": 0.5,
+    "x0": 0.0,
+    "y0": 0.0,
+    "with_bounds": true,
+    "field": "SinMultiPeak",
+    "mu_lim": [0.5, 1.5],
+    "bc_type": "periodic",
+    "viscosity": 0.005,
+    "upwind": true,
+    "upwind_order": 2,
+    "compact": true,
+    "constraint_type": "strong",
+    "scaling": -1,
+    "nt": 1,
+    "tol": 1e-8,
+    "maxit": 10,
+    "check_unique_models": true,
+    "nets_dir": "/p/lustre5/colekend/ddrom_dist_scaling_may19/run_3by3_new2/nets",
+    "nets_layout": "merged",
+    "nets_tag": {
+      "interior": "",
+      "port": ""
+    },
+    "profile_maxit_env": "DDNMROM_PROFILE_MAXIT"
+  }
+}

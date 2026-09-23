@@ -1,5 +1,7 @@
 import abc
 import copy
+from collections import OrderedDict
+import time
 import numpy as np
 
 import torch
@@ -12,6 +14,53 @@ import dd_nm_rom.config as cfg
 #torch._logging.set_logs(graph_code=True)
 
 _ACT_IDS = ("elu", "linear", "mixed", "relu", "sigmoid", "swish", "softplus")
+_COMPILED_CACHE_MAXSIZE = 32
+_COMPILED_CACHE = OrderedDict()
+_COMPILE_STATS = {}
+
+
+def reset_compile_stats():
+  """Reset preparation-time activation compilation statistics."""
+  global _COMPILE_STATS
+  _COMPILE_STATS = {
+    "warmup_calls": 0,
+    "compile_disabled_calls": 0,
+    "compile_enabled_calls": 0,
+    "eligible_calls": 0,
+    "skipped_small": 0,
+    "skipped_linear": 0,
+    "skipped_mixed": 0,
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "compiled_functions": 0,
+    "compile_warmup_seconds": 0.0,
+    "by_role_activation": {},
+  }
+
+
+def get_compile_stats():
+  """Return JSON-serializable preparation-time compilation statistics."""
+  return copy.deepcopy(_COMPILE_STATS)
+
+
+def _role_stats(role, act):
+  key = "{}:{}".format(role or "unknown", type(act).__name__)
+  stats = _COMPILE_STATS["by_role_activation"].setdefault(
+    key,
+    {
+      "warmup_calls": 0,
+      "eligible_calls": 0,
+      "cache_hits": 0,
+      "cache_misses": 0,
+      "size_min": None,
+      "size_max": None,
+      "size_total": 0,
+    },
+  )
+  return stats
+
+
+reset_compile_stats()
 
 
 def _maybe_compile(fun):
@@ -42,23 +91,94 @@ def _should_compile():
   return value.lower() in ("1", "true", "yes", "on")
 
 
-def warmup(act, size, device, dtype):
-  """Trigger the first compiled activation call before distributed work."""
-  if not _should_compile():
-    return
+def warmup(act, size, device, dtype, role="unknown"):
+  """Bind and warm an activation when compilation can amortize its overhead.
 
+  Activation functions are called between sparse matrix operations, so
+  compiling tiny or masked functions generally adds launch and wrapper
+  overhead without enabling useful fusion.  The size threshold keeps the
+  opt-in compiler path focused on sufficiently large, regular activations.
+  """
+  size = int(size)
+  _COMPILE_STATS["warmup_calls"] += 1
+  role_stats = _role_stats(role, act)
+  role_stats["warmup_calls"] += 1
+  role_stats["size_total"] += size
+  role_stats["size_min"] = (
+    size if role_stats["size_min"] is None
+    else min(role_stats["size_min"], size)
+  )
+  role_stats["size_max"] = (
+    size if role_stats["size_max"] is None
+    else max(role_stats["size_max"], size)
+  )
+
+  if not _should_compile():
+    _COMPILE_STATS["compile_disabled_calls"] += 1
+    return False
+
+  _COMPILE_STATS["compile_enabled_calls"] += 1
+  min_size = int(cfg.get_config_val("DDNMROM_ACT_COMPILE_MIN_SIZE"))
+  if size < min_size:
+    _COMPILE_STATS["skipped_small"] += 1
+    return False
+  if isinstance(act, Linear):
+    _COMPILE_STATS["skipped_linear"] += 1
+    return False
   if isinstance(act, Mixed):
-    # Mixed activations compile their component functions lazily.  Warm each
-    # non-empty mask separately because the masked implementation does not
-    # invoke components whose masks are empty.
-    for (component, mask) in act.masks.values():
-      if mask.size:
-        component(
-          torch.zeros(mask.size, device=device, dtype=dtype),
-          with_jac=False
-        )
+    _COMPILE_STATS["skipped_mixed"] += 1
+    # Linear activations have no useful work to optimize. Mixed activations
+    # contain Python-level masked indexing and are deliberately kept as one
+    # eager operation rather than partially compiling their components.
+    return False
+
+  _COMPILE_STATS["eligible_calls"] += 1
+  role_stats["eligible_calls"] += 1
+
+  device_key = str(torch.device(device))
+  dtype_key = str(dtype)
+  signature = (type(act).__name__, getattr(act, "alpha", None))
+  key = (signature, device_key, dtype_key)
+  compiled = _COMPILED_CACHE.get(key)
+  cache_miss = compiled is None
+  if cache_miss:
+    _COMPILE_STATS["cache_misses"] += 1
+    role_stats["cache_misses"] += 1
+    start = time.perf_counter()
+    # Compile pure closures over activation parameters.  This allows the
+    # result to be reused by equivalent activation objects and avoids making
+    # the bound Python object part of the compiled graph.
+    def fun(x, activation=act):
+      return activation._fun_torch(x)
+
+    # Compile the forward and Jacobian together for eligible large
+    # activations. This avoids the compiled/eager split on the dominant
+    # with_jac=True path. Small activations never reach this branch.
+    def fun_jac(x, activation=act):
+      return activation._fun_torch(x), activation._jac_torch(x)
+
+    compiled = (_maybe_compile(fun), _maybe_compile(fun_jac))
+    _COMPILED_CACHE[key] = compiled
+    _COMPILED_CACHE.move_to_end(key)
+    while len(_COMPILED_CACHE) > _COMPILED_CACHE_MAXSIZE:
+      _COMPILED_CACHE.popitem(last=False)
   else:
-    act(torch.zeros(size, device=device, dtype=dtype), with_jac=False)
+    _COMPILE_STATS["cache_hits"] += 1
+    role_stats["cache_hits"] += 1
+    _COMPILED_CACHE.move_to_end(key)
+
+  act.fun, act._compiled_fun_jac = compiled
+  x = torch.zeros(size, device=device, dtype=dtype)
+  act.fun(x)
+  act._compiled_fun_jac(x)
+  if cache_miss:
+    # The first invocation is lazy for Torch Inductor, so include it in the
+    # preparation statistic. Cache-hit warmups are intentionally not included.
+    # Keep this branch free of CUDA synchronization; DD_NM_ROM synchronizes
+    # once after all ranks finish preparation.
+    _COMPILE_STATS["compile_warmup_seconds"] += time.perf_counter() - start
+    _COMPILE_STATS["compiled_functions"] += 2
+  return True
 
 
 def get(identifier='sigmoid', *args, **kwargs):
@@ -77,22 +197,13 @@ def get(identifier='sigmoid', *args, **kwargs):
         BaseAct._fun = BaseAct._fun_torch
         BaseAct._jac = BaseAct._jac_torch
 
-        # Keep the Torch path on compiled callables when the function is
-        # simple enough to trace. Mixed activations retain the Python version
-        # because their masked indexing is less stable under compilation.
-        # The Torch Jacobian stays as a derivative vector. Callers apply it as
-        # row/column scaling so we avoid sparse diagonal multiplies in CUDA.
-        if _should_compile() and not isinstance(act, Mixed):
-          compiled_fun = _maybe_compile(act._fun_torch)
-          act._fun_torch = compiled_fun
-          act._fun = compiled_fun
-          act.fun = act._fun
-          act.jac = act._jac_torch
-        else:
-          act._fun = act._fun_torch
-          act._jac = act._jac_torch
-          act.fun = act._fun
-          act.jac = act._jac_torch
+        # Compilation is deferred until warmup knows the actual shape.  The
+        # eager path remains valid if compilation is disabled or unsupported.
+        act._fun = act._fun_torch
+        act._jac = act._jac_torch
+        act.fun = act._fun
+        act.jac = act._jac_torch
+        act._compiled_fun_jac = None
     return act
   else:
     raise ValueError(
@@ -106,12 +217,15 @@ class BaseAct(object):
   def __init__(self):
     self.fun = self._fun
     self.jac = lambda x: sp_diag(self._jac(x))
+    self._compiled_fun_jac = None
 
   def __call__(self, x, with_jac=True):
     return (self.fun(x), self.jac(x)) if with_jac else self.fun(x)
 
   def _call__torch(self, x, with_jac=True):
     if with_jac:
+      if self._compiled_fun_jac is not None:
+        return self._compiled_fun_jac(x)
       return (self.fun(x), self.jac(x))
     else:
       return self.fun(x)

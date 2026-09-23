@@ -1,12 +1,12 @@
 {
   "name": "dd_rom",
   "target": "benchmarks.workloads_dd:dd_rom",
-  "warmups": 0,
-  "repetitions": 1,
+  "warmups": 2,
+  "repetitions": 10,
   "threads": 8,
   "config": {
-    "n_sub_x": 6,
-    "n_sub_y": 6,
+    "n_sub_x": 10,
+    "n_sub_y": 10,
     "nx_intr": 48,
     "ny_intr": 48,
     "lx_sub": 0.5,

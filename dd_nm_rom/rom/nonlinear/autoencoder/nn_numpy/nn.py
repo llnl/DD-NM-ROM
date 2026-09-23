@@ -88,11 +88,12 @@ class Block(object):
   def _warmup_activation(self, activation, size, reference):
     if not bkd.is_torch_backend():
       return
-    act_mod.warmup(
+    return act_mod.warmup(
       activation,
       int(size),
       device=bkd.device(),
-      dtype=reference.dtype
+      dtype=reference.dtype,
+      role=self.name,
     )
 
   @abc.abstractmethod
@@ -125,7 +126,7 @@ class Encoder(Block):
     return comp
 
   def compile_activations(self):
-    self._warmup_activation(
+    return self._warmup_activation(
       self.activation,
       self.w["b1_ref"].shape[0],
       self.w["b1_ref"]
@@ -169,7 +170,7 @@ class Decoder(Block):
     return comp
 
   def compile_activations(self):
-    self._warmup_activation(
+    return self._warmup_activation(
       self.activation,
       self.w["b1"].shape[0],
       self.w["b1"]
@@ -336,8 +337,9 @@ class Autoencoder(object):
     return self.decoder(self.encoder(x, with_jac=False), with_jac=False)
 
   def compile_activations(self):
-    self.encoder.compile_activations()
-    self.decoder.compile_activations()
+    encoder_compiled = self.encoder.compile_activations()
+    decoder_compiled = self.decoder.compile_activations()
+    return encoder_compiled or decoder_compiled
 
   def __eq__(self, other):
     comp = (self.name == other.name)

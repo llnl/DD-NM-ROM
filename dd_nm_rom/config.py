@@ -20,6 +20,7 @@ _DDNMROM_SOLVE_LINE_SEARCH = True
 
 # Activation options
 _DDNMROM_ACT_COMPILE = True
+_DDNMROM_ACT_COMPILE_MIN_SIZE = 4096
 
 # Backend specific options
 # NOTE: not all options are used by all backends or runtimes (numpy, pytorch, or cpu/gpu serial or parallel)
@@ -46,6 +47,7 @@ _env_vars = {
   "DDNMROM_SOLVE_LINE_SEARCH": _DDNMROM_SOLVE_LINE_SEARCH, # enable Armijo backtracking in the distributed Newton solver
   # Activation options
   "DDNMROM_ACT_COMPILE": _DDNMROM_ACT_COMPILE, # enable torch.compile for Torch activations
+  "DDNMROM_ACT_COMPILE_MIN_SIZE": _DDNMROM_ACT_COMPILE_MIN_SIZE, # minimum activation width to compile
   # Backend specific options
   "DDNMROM_DEVICE_PER_NODE": _DDNMROM_BACKEND_DEVICE_PER_NODE, # physical devices per node, used to map gpus to physical layout, change depending on hardware
   "DDNMROM_MPI_BUFFER_ZEROFILL": _DDNMROM_BACKEND_MPI_FILLZERO, # whether to create communication buffers always filled with zero, or empty memory

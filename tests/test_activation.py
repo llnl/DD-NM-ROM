@@ -114,14 +114,97 @@ def test_activation_compile_flag_controls_torch_compile(monkeypatch):
     return fun
 
   monkeypatch.setattr(torch, "compile", fake_compile, raising=True)
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
   monkeypatch.setenv("DDNMROM_ACT_COMPILE", "0")
   activation.get("softplus")
   assert calls == []
 
   monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
-  activation.get("softplus")
-  assert len(calls) == 1
-  assert calls[0][1] == {"backend": "inductor", "dynamic": True}
+  act = activation.get("softplus")
+  activation.warmup(act, 4096, "cpu", torch.float32)
+  assert len(calls) == 2
+  assert all(
+    call[1] == {"backend": "inductor", "dynamic": True}
+    for call in calls
+  )
+
+
+def test_compiled_activations_are_cached_across_sizes(monkeypatch):
+  calls = []
+
+  def fake_compile(fun, **kwargs):
+    calls.append((fun, kwargs))
+    return fun
+
+  monkeypatch.setattr(torch, "compile", fake_compile, raising=True)
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
+  activation.warmup(activation.get("softplus"), 4096, "cpu", torch.float32)
+  activation.warmup(activation.get("softplus"), 4096, "cpu", torch.float32)
+  activation.warmup(activation.get("softplus"), 8192, "cpu", torch.float32)
+  assert len(calls) == 2
+
+
+def test_compile_stats_report_eligibility_and_cache_use(monkeypatch):
+  def fake_compile(fun, **kwargs):
+    return fun
+
+  monkeypatch.setattr(torch, "compile", fake_compile, raising=True)
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
+
+  activation.warmup(
+    activation.get("softplus"),
+    4096,
+    "cpu",
+    torch.float32,
+    role="decoder",
+  )
+  activation.warmup(
+    activation.get("softplus"),
+    4096,
+    "cpu",
+    torch.float32,
+    role="decoder",
+  )
+  activation.warmup(
+    activation.get("softplus"),
+    1024,
+    "cpu",
+    torch.float32,
+    role="encoder",
+  )
+
+  stats = activation.get_compile_stats()
+  assert stats["warmup_calls"] == 3
+  assert stats["eligible_calls"] == 2
+  assert stats["cache_misses"] == 1
+  assert stats["cache_hits"] == 1
+  assert stats["skipped_small"] == 1
+  assert stats["compiled_functions"] == 2
+  assert stats["by_role_activation"]["decoder:Softplus"]["size_max"] == 4096
+  assert stats["by_role_activation"]["encoder:Softplus"]["size_max"] == 1024
+
+
+def test_small_and_trivial_activations_stay_eager(monkeypatch):
+  calls = []
+
+  monkeypatch.setattr(
+    torch,
+    "compile",
+    lambda fun, **kwargs: calls.append((fun, kwargs)) or fun,
+    raising=True,
+  )
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  activation._COMPILED_CACHE.clear()
+
+  assert activation.warmup(activation.get("softplus"), 4095, "cpu", torch.float32) is False
+  assert activation.warmup(activation.get("linear"), 8192, "cpu", torch.float32) is False
+  assert activation.warmup(activation.get("mixed", masks={}), 8192, "cpu", torch.float32) is False
+  assert calls == []
 
 
 def test_cpu_uses_eager_activations_by_default(monkeypatch):

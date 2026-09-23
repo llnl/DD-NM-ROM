@@ -10,6 +10,7 @@ each global domain size supported by the experiment.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,12 @@ def _subdomains(config: dict[str, Any]) -> tuple[int, int, int]:
     return n_sub_x, n_sub_y, total
 
 
-def _metrics(converged: Any, residuals: Any, runtime: Any) -> dict[str, Any]:
+def _metrics(
+    converged: Any,
+    residuals: Any,
+    runtime: Any,
+    activation_compile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     try:
         iterations = len(residuals)
     except TypeError:
@@ -36,12 +42,15 @@ def _metrics(converged: Any, residuals: Any, runtime: Any) -> dict[str, Any]:
             residual_norm = float(np.linalg.norm(bkd.to_numpy(residuals[-1])))
         except (IndexError, TypeError, ValueError):
             residual_norm = None
-    return {
+    metrics = {
         "converged": bool(converged),
         "newton_iterations": iterations,
         "residual_norm": residual_norm,
         "internal_timing": runtime,
     }
+    if activation_compile is not None:
+        metrics["activation_compile"] = activation_compile
+    return metrics
 
 
 def dd_fom_steady_prepare(config: dict[str, Any]) -> dict[str, Any]:
@@ -244,8 +253,91 @@ def dd_rom_run(state: dict[str, Any]) -> dict[str, Any]:
         verbose=bool(config.get("verbose", False)),
     )
     del uv, z, lambdas
-    return _metrics(converged, residuals, dd_rom.runtime)
+    return _metrics(
+        converged,
+        residuals,
+        dd_rom.runtime,
+        activation_compile=dd_rom.activation_compile_stats,
+    )
 
 
 def dd_rom(config: dict[str, Any]) -> dict[str, Any]:
     return dd_rom_run(dd_rom_prepare(config))
+
+
+def _decoder_activation_inputs(dd_rom: Any, x0: Any) -> list[tuple[Any, Any]]:
+    """Build actual decoder preactivations from the DD-ROM initial state."""
+    z0 = dd_rom.get_init_sol(x=x0)
+    z = dd_rom.extract_z_sub_from_vec(z0, use_global=True)
+    inputs = []
+    for s, sub in enumerate(dd_rom.subdomains):
+        for element in ("interior", "interface"):
+            state = sub.elem_states[element]
+            state.set_decoder_hr(active=False)
+            decoder = state.nn_model.decoder
+            hidden = decoder.w["W1"] @ z[s][element] + decoder.w["b1"]
+            inputs.append((decoder.activation, hidden))
+    return inputs
+
+
+def dd_rom_activation_prepare(config: dict[str, Any]) -> dict[str, Any]:
+    """Prepare the same DD-ROM workload for activation-only profiling."""
+    state = dd_rom_prepare(config)
+    state["activation_inputs"] = _decoder_activation_inputs(
+        state["dd_rom"], state["x0"]
+    )
+    return state
+
+
+def dd_rom_activation_run(state: dict[str, Any]) -> dict[str, Any]:
+    """Time decoder activation/Jacobian calls using workload-shaped inputs.
+
+    Model construction, activation compilation, and latent-state preparation
+    remain outside the measured region. CUDA events measure device execution
+    without synchronizing once per activation call.
+    """
+    from dd_nm_rom import backend as bkd
+
+    inputs = state["activation_inputs"]
+    with_jac = bool(state["config"].get("activation_with_jac", True))
+    activation_elements = sum(
+        int(hidden.numel()) if hasattr(hidden, "numel") else int(np.size(hidden))
+        for _, hidden in inputs
+    )
+    device = bkd.device()
+    is_cuda = bkd.is_torch_backend() and getattr(device, "type", str(device)) == "cuda"
+
+    if is_cuda:
+        import torch
+
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        outputs = [
+            activation(hidden, with_jac=with_jac)
+            for activation, hidden in inputs
+        ]
+        end.record()
+        end.synchronize()
+        elapsed = start.elapsed_time(end) / 1000.0
+    else:
+        start_time = time.perf_counter()
+        outputs = [
+            activation(hidden, with_jac=with_jac)
+            for activation, hidden in inputs
+        ]
+        elapsed = time.perf_counter() - start_time
+
+    del outputs
+    return {
+        "activation_timing_seconds": elapsed,
+        "activation_calls": len(inputs),
+        "activation_elements": activation_elements,
+        "activation_with_jac": with_jac,
+        "activation_compile": state["dd_rom"].activation_compile_stats,
+    }
+
+
+def dd_rom_activation(config: dict[str, Any]) -> dict[str, Any]:
+    return dd_rom_activation_run(dd_rom_activation_prepare(config))

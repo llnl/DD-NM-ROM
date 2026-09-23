@@ -106,6 +106,37 @@ def test_compiled_torch_activations(name, values, kwargs):
   np.testing.assert_allclose(jac_torch.cpu().numpy(), np.diag(jac_np.todense()))
 
 
+def test_mixed_torch_activation_uses_device_indices():
+  values = np.array([-2.0, -0.5, 0.0, 0.25, 3.0, 1.5])
+  masks = {
+    "softplus": np.array([0, 2, 5]),
+    "relu": np.array([1, 3, 4]),
+  }
+  x_torch = _torch_activation_input(values)
+
+  expected = deepcopy(values)
+  expected[masks["softplus"]] = activation.Softplus()._fun(
+    values[masks["softplus"]]
+  )
+  expected[masks["relu"]] = activation.ReLU()._fun(values[masks["relu"]])
+  expected_jac = np.zeros_like(values)
+  expected_jac[masks["softplus"]] = activation.Softplus()._jac(
+    values[masks["softplus"]]
+  )
+  expected_jac[masks["relu"]] = activation.ReLU()._jac(values[masks["relu"]])
+  mixed_torch = activation.get("mixed", masks=masks)
+  actual, actual_jac = mixed_torch(x_torch, with_jac=True)
+
+  np.testing.assert_allclose(actual.cpu().numpy(), expected)
+  np.testing.assert_allclose(
+    actual_jac.cpu().numpy(),
+    expected_jac,
+  )
+  assert len(mixed_torch._torch_masks) == 1
+  assert set(mixed_torch._torch_masks[next(iter(mixed_torch._torch_masks))]) == \
+    {"softplus", "relu"}
+
+
 def test_activation_compile_flag_controls_torch_compile(monkeypatch):
   calls = []
 

@@ -420,8 +420,37 @@ class Mixed(BaseAct):
   def __init__(self, masks):
     super(Mixed, self).__init__()
     self.masks = {}
+    # Keep the public NumPy masks for model construction and HR handling, but
+    # lazily materialize one device-resident index tensor per Torch device.
+    # This avoids converting masks and creating indexing tensors on every
+    # activation call.
+    self._torch_masks = {}
     for (act, mask) in masks.items():
       self.masks[act] = (get(act), mask.reshape(-1))
+
+  def _torch_mask(self, act_id, mask, device):
+    device_key = str(torch.device(device))
+    device_masks = self._torch_masks.setdefault(device_key, {})
+    indices = device_masks.get(act_id)
+    if indices is None:
+      if torch.is_tensor(mask):
+        mask = mask.reshape(-1)
+        if mask.dtype == torch.bool:
+          indices = torch.nonzero(mask, as_tuple=False).reshape(-1)
+        else:
+          indices = mask.to(dtype=torch.long)
+        indices = indices.to(device=device)
+      else:
+        mask_array = np.asarray(mask).reshape(-1)
+        if mask_array.dtype == np.bool_:
+          mask_array = np.flatnonzero(mask_array)
+        indices = torch.as_tensor(
+          mask_array,
+          dtype=torch.long,
+          device=device,
+        )
+      device_masks[act_id] = indices
+    return indices
 
   def _fun(self, x):
     y = copy.deepcopy(x)
@@ -437,14 +466,18 @@ class Mixed(BaseAct):
 
   def _fun_torch(self, x):
     y = torch.clone(x)
-    for (act, mask) in self.masks.values():
-      y[mask] = act._fun_torch(x[mask])
+    for (act_id, (act, mask)) in self.masks.items():
+      indices = self._torch_mask(act_id, mask, x.device)
+      values = act._fun_torch(x.index_select(0, indices))
+      y.index_copy_(0, indices, values)
     return y
 
   def _jac_torch(self, x):
     y = torch.zeros_like(x)
-    for (act, mask) in self.masks.values():
-      y[mask] = act._jac_torch(x[mask])
+    for (act_id, (act, mask)) in self.masks.items():
+      indices = self._torch_mask(act_id, mask, x.device)
+      values = act._jac_torch(x.index_select(0, indices))
+      y.index_copy_(0, indices, values)
     return y
 
 # Softplus

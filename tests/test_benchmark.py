@@ -5,6 +5,7 @@ from argparse import Namespace
 import pytest
 
 from benchmarks import benchmark
+from benchmarks import workloads_dd
 
 
 def _args(**overrides):
@@ -60,3 +61,10 @@ def test_explicit_scheduler_launcher_requires_allocation(monkeypatch):
 
   with pytest.raises(ValueError, match="active Flux allocation"):
     benchmark._select_local_launcher("flux")
+
+
+def test_activation_path_key_uses_role_and_activation_type():
+  class Softplus:
+    pass
+
+  assert workloads_dd._activation_path("decoder", Softplus()) == "decoder:Softplus"

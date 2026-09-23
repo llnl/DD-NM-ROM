@@ -30,6 +30,9 @@ def reset_compile_stats():
     "skipped_small": 0,
     "skipped_linear": 0,
     "skipped_mixed": 0,
+    "skipped_role": 0,
+    "skipped_no_path": 0,
+    "skipped_cache_full": 0,
     "cache_hits": 0,
     "cache_misses": 0,
     "compiled_functions": 0,
@@ -52,6 +55,7 @@ def _role_stats(role, act):
       "eligible_calls": 0,
       "cache_hits": 0,
       "cache_misses": 0,
+      "skipped_cache_full": 0,
       "size_min": None,
       "size_max": None,
       "size_total": 0,
@@ -72,7 +76,7 @@ def _maybe_compile(fun):
   # Compilation is intentionally not wrapped in an eager fallback.  When
   # compilation is enabled, a compiler failure must be reported rather than
   # silently changing the execution path on one rank.
-  return torch.compile(fun, backend="inductor", dynamic=True)
+  return torch.compile(fun, backend="inductor", dynamic=False)
 
 
 def _should_compile():
@@ -89,6 +93,32 @@ def _should_compile():
   if value is None:
     return torch.cuda.is_available()
   return value.lower() in ("1", "true", "yes", "on")
+
+
+def _config_bool(name):
+  """Read a boolean configuration value with support for typed defaults."""
+  value = cfg.get_config_val(name)
+  if isinstance(value, bool):
+    return value
+  return value.lower() in ("1", "true", "yes", "on")
+
+
+def _role_should_compile(role):
+  """Return whether compilation is enabled for an encoder or decoder."""
+  if role == "encoder":
+    return _config_bool("DDNMROM_ACT_COMPILE_ENCODER")
+  if role == "decoder":
+    return _config_bool("DDNMROM_ACT_COMPILE_DECODER")
+  # Preserve direct warmup API behavior for callers that do not identify a
+  # model role. Model warmup passes an explicit role.
+  return True
+
+
+def _set_eager(act):
+  """Restore an activation object to its eager Torch callables."""
+  act.fun = act._fun_torch
+  act.jac = act._jac_torch
+  act._compiled_fun_jac = None
 
 
 def warmup(act, size, device, dtype, role="unknown"):
@@ -115,21 +145,35 @@ def warmup(act, size, device, dtype, role="unknown"):
 
   if not _should_compile():
     _COMPILE_STATS["compile_disabled_calls"] += 1
+    _set_eager(act)
     return False
 
   _COMPILE_STATS["compile_enabled_calls"] += 1
+  if not _role_should_compile(role):
+    _COMPILE_STATS["skipped_role"] += 1
+    _set_eager(act)
+    return False
+  compile_forward = _config_bool("DDNMROM_ACT_COMPILE_FORWARD")
+  compile_jac = _config_bool("DDNMROM_ACT_COMPILE_JAC")
+  if not compile_forward and not compile_jac:
+    _COMPILE_STATS["skipped_no_path"] += 1
+    _set_eager(act)
+    return False
   min_size = int(cfg.get_config_val("DDNMROM_ACT_COMPILE_MIN_SIZE"))
   if size < min_size:
     _COMPILE_STATS["skipped_small"] += 1
+    _set_eager(act)
     return False
   if isinstance(act, Linear):
     _COMPILE_STATS["skipped_linear"] += 1
+    _set_eager(act)
     return False
   if isinstance(act, Mixed):
     _COMPILE_STATS["skipped_mixed"] += 1
     # Linear activations have no useful work to optimize. Mixed activations
     # contain Python-level masked indexing and are deliberately kept as one
     # eager operation rather than partially compiling their components.
+    _set_eager(act)
     return False
 
   _COMPILE_STATS["eligible_calls"] += 1
@@ -137,47 +181,73 @@ def warmup(act, size, device, dtype, role="unknown"):
 
   device_key = str(torch.device(device))
   dtype_key = str(dtype)
+  input_shape = (size,)
   signature = (type(act).__name__, getattr(act, "alpha", None))
-  key = (signature, device_key, dtype_key)
+  key = (
+    signature,
+    device_key,
+    dtype_key,
+    input_shape,
+    compile_forward,
+    compile_jac,
+  )
   compiled = _COMPILED_CACHE.get(key)
   cache_miss = compiled is None
   if cache_miss:
+    # Static compilation creates one specialization per input shape. Retain
+    # existing specializations, but avoid evicting and recompiling them when
+    # a workload introduces too many unique shapes; those new shapes remain
+    # on the eager path instead.
+    if len(_COMPILED_CACHE) >= _COMPILED_CACHE_MAXSIZE:
+      _COMPILE_STATS["skipped_cache_full"] += 1
+      role_stats["skipped_cache_full"] = role_stats.get("skipped_cache_full", 0) + 1
+      _set_eager(act)
+      return False
     _COMPILE_STATS["cache_misses"] += 1
     role_stats["cache_misses"] += 1
     start = time.perf_counter()
-    # Compile pure closures over activation parameters.  This allows the
+    # Compile pure closures over activation parameters. This allows the
     # result to be reused by equivalent activation objects and avoids making
-    # the bound Python object part of the compiled graph.
-    def fun(x, activation=act):
-      return activation._fun_torch(x)
+    # the bound Python object part of the compiled graph. Compile only the
+    # paths selected by configuration; the defaults target the decoder
+    # Jacobian used by the Newton solve.
+    compiled_fun = None
+    compiled_fun_jac = None
+    if compile_forward:
+      def fun(x, activation=act):
+        return activation._fun_torch(x)
+      compiled_fun = _maybe_compile(fun)
+    if compile_jac:
+      def fun_jac(x, activation=act):
+        return activation._fun_torch(x), activation._jac_torch(x)
+      compiled_fun_jac = _maybe_compile(fun_jac)
 
-    # Compile the forward and Jacobian together for eligible large
-    # activations. This avoids the compiled/eager split on the dominant
-    # with_jac=True path. Small activations never reach this branch.
-    def fun_jac(x, activation=act):
-      return activation._fun_torch(x), activation._jac_torch(x)
-
-    compiled = (_maybe_compile(fun), _maybe_compile(fun_jac))
+    compiled = (compiled_fun, compiled_fun_jac)
     _COMPILED_CACHE[key] = compiled
     _COMPILED_CACHE.move_to_end(key)
-    while len(_COMPILED_CACHE) > _COMPILED_CACHE_MAXSIZE:
-      _COMPILED_CACHE.popitem(last=False)
   else:
     _COMPILE_STATS["cache_hits"] += 1
     role_stats["cache_hits"] += 1
     _COMPILED_CACHE.move_to_end(key)
 
-  act.fun, act._compiled_fun_jac = compiled
+  compiled_fun, compiled_fun_jac = compiled
+  act.fun = compiled_fun if compiled_fun is not None else act._fun_torch
+  act.jac = act._jac_torch
+  act._compiled_fun_jac = compiled_fun_jac
   x = torch.zeros(size, device=device, dtype=dtype)
-  act.fun(x)
-  act._compiled_fun_jac(x)
+  if compiled_fun is not None:
+    act.fun(x)
+  if compiled_fun_jac is not None:
+    act._compiled_fun_jac(x)
   if cache_miss:
     # The first invocation is lazy for Torch Inductor, so include it in the
     # preparation statistic. Cache-hit warmups are intentionally not included.
     # Keep this branch free of CUDA synchronization; DD_NM_ROM synchronizes
     # once after all ranks finish preparation.
     _COMPILE_STATS["compile_warmup_seconds"] += time.perf_counter() - start
-    _COMPILE_STATS["compiled_functions"] += 2
+    _COMPILE_STATS["compiled_functions"] += (
+      int(compiled_fun is not None) + int(compiled_fun_jac is not None)
+    )
   return True
 
 

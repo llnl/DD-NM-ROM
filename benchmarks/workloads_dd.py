@@ -265,7 +265,10 @@ def dd_rom(config: dict[str, Any]) -> dict[str, Any]:
     return dd_rom_run(dd_rom_prepare(config))
 
 
-def _decoder_activation_inputs(dd_rom: Any, x0: Any) -> list[tuple[Any, Any]]:
+def _decoder_activation_inputs(
+    dd_rom: Any,
+    x0: Any,
+) -> list[tuple[str, Any, Any]]:
     """Build actual decoder preactivations from the DD-ROM initial state."""
     z0 = dd_rom.get_init_sol(x=x0)
     z = dd_rom.extract_z_sub_from_vec(z0, use_global=True)
@@ -276,8 +279,13 @@ def _decoder_activation_inputs(dd_rom: Any, x0: Any) -> list[tuple[Any, Any]]:
             state.set_decoder_hr(active=False)
             decoder = state.nn_model.decoder
             hidden = decoder.w["W1"] @ z[s][element] + decoder.w["b1"]
-            inputs.append((decoder.activation, hidden))
+            inputs.append(("decoder", decoder.activation, hidden))
     return inputs
+
+
+def _activation_path(role: str, activation: Any) -> str:
+    """Return the stable profile key for one activation execution path."""
+    return f"{role}:{type(activation).__name__}"
 
 
 def dd_rom_activation_prepare(config: dict[str, Any]) -> dict[str, Any]:
@@ -302,10 +310,24 @@ def dd_rom_activation_run(state: dict[str, Any]) -> dict[str, Any]:
     with_jac = bool(state["config"].get("activation_with_jac", True))
     activation_elements = sum(
         int(hidden.numel()) if hasattr(hidden, "numel") else int(np.size(hidden))
-        for _, hidden in inputs
+        for _, _, hidden in inputs
     )
     device = bkd.device()
     is_cuda = bkd.is_torch_backend() and getattr(device, "type", str(device)) == "cuda"
+
+    by_path = {}
+    grouped_inputs = {}
+    for role, activation, hidden in inputs:
+        path = _activation_path(role, activation)
+        path_metrics = by_path.setdefault(
+            path,
+            {"calls": 0, "elements": 0, "seconds": 0.0},
+        )
+        path_metrics["calls"] += 1
+        path_metrics["elements"] += (
+            int(hidden.numel()) if hasattr(hidden, "numel") else int(np.size(hidden))
+        )
+        grouped_inputs.setdefault(path, []).append((activation, hidden))
 
     if is_cuda:
         import torch
@@ -314,19 +336,33 @@ def dd_rom_activation_run(state: dict[str, Any]) -> dict[str, Any]:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        outputs = [
-            activation(hidden, with_jac=with_jac)
-            for activation, hidden in inputs
-        ]
+        outputs = []
+        path_events = []
+        for path, path_inputs in grouped_inputs.items():
+            path_start = torch.cuda.Event(enable_timing=True)
+            path_end = torch.cuda.Event(enable_timing=True)
+            path_start.record()
+            outputs.extend(
+                activation(hidden, with_jac=with_jac)
+                for activation, hidden in path_inputs
+            )
+            path_end.record()
+            path_events.append((path, path_start, path_end))
         end.record()
         end.synchronize()
         elapsed = start.elapsed_time(end) / 1000.0
+        for path, path_start, path_end in path_events:
+            by_path[path]["seconds"] = path_start.elapsed_time(path_end) / 1000.0
     else:
         start_time = time.perf_counter()
-        outputs = [
-            activation(hidden, with_jac=with_jac)
-            for activation, hidden in inputs
-        ]
+        outputs = []
+        for path, path_inputs in grouped_inputs.items():
+            path_start = time.perf_counter()
+            outputs.extend(
+                activation(hidden, with_jac=with_jac)
+                for activation, hidden in path_inputs
+            )
+            by_path[path]["seconds"] = time.perf_counter() - path_start
         elapsed = time.perf_counter() - start_time
 
     del outputs
@@ -335,6 +371,7 @@ def dd_rom_activation_run(state: dict[str, Any]) -> dict[str, Any]:
         "activation_calls": len(inputs),
         "activation_elements": activation_elements,
         "activation_with_jac": with_jac,
+        "activation_by_path": by_path,
         "activation_compile": state["dd_rom"].activation_compile_stats,
     }
 

@@ -16,12 +16,14 @@ import dd_nm_rom.config as cfg
 _ACT_IDS = ("elu", "linear", "mixed", "relu", "sigmoid", "swish", "softplus")
 _COMPILED_CACHE_MAXSIZE = 32
 _COMPILED_CACHE = OrderedDict()
+_MIXED_LAYOUT_COUNTS = {}
 _COMPILE_STATS = {}
 
 
 def reset_compile_stats():
   """Reset preparation-time activation compilation statistics."""
-  global _COMPILE_STATS
+  global _COMPILE_STATS, _MIXED_LAYOUT_COUNTS
+  _MIXED_LAYOUT_COUNTS = {}
   _COMPILE_STATS = {
     "warmup_calls": 0,
     "compile_disabled_calls": 0,
@@ -30,6 +32,8 @@ def reset_compile_stats():
     "skipped_small": 0,
     "skipped_linear": 0,
     "skipped_mixed": 0,
+    "skipped_allowlist": 0,
+    "skipped_mixed_frequency": 0,
     "skipped_role": 0,
     "skipped_no_path": 0,
     "skipped_cache_full": 0,
@@ -56,6 +60,8 @@ def _role_stats(role, act):
       "cache_hits": 0,
       "cache_misses": 0,
       "skipped_cache_full": 0,
+      "skipped_allowlist": 0,
+      "skipped_mixed_frequency": 0,
       "size_min": None,
       "size_max": None,
       "size_total": 0,
@@ -114,32 +120,50 @@ def _role_should_compile(role):
   return True
 
 
+def _activation_should_compile(act):
+  """Return whether an activation type is selected by the allowlist."""
+  value = cfg.get_config_val("DDNMROM_ACT_COMPILE_ACTIVATIONS")
+  names = {
+    name.strip().lower()
+    for name in value.split(",")
+    if name.strip()
+  }
+  return "all" in names or type(act).__name__.lower() in names
+
+
+def _is_mixed_cache_key(key):
+  return key[0] == "Mixed"
+
+
 def _set_eager(act):
   """Restore an activation object to its eager Torch callables."""
   act.fun = act._fun_torch
   act.jac = act._jac_torch
+  act._compiled_fun = None
   act._compiled_fun_jac = None
 
 
 def _mixed_fun_from_parts(x, parts):
-  y = torch.clone(x)
-  for act, indices in parts:
+  activation_parts, full_coverage = parts
+  y = torch.empty_like(x) if full_coverage else torch.clone(x)
+  for act, indices in activation_parts:
     values = act._fun_torch(x.index_select(0, indices))
     y.index_copy_(0, indices, values)
   return y
 
 
 def _mixed_fun_jac_from_parts(x, parts):
-  y = torch.clone(x)
-  dy = torch.zeros_like(x)
-  for act, indices in parts:
+  activation_parts, full_coverage = parts
+  y = torch.empty_like(x) if full_coverage else torch.clone(x)
+  dy = torch.empty_like(x) if full_coverage else torch.zeros_like(x)
+  for act, indices in activation_parts:
     values = x.index_select(0, indices)
     y.index_copy_(0, indices, act._fun_torch(values))
     dy.index_copy_(0, indices, act._jac_torch(values))
   return y, dy
 
 
-def warmup(act, size, device, dtype, role="unknown"):
+def warmup(act, size, device, dtype, role="unknown", force=False):
   """Bind and warm an activation when compilation can amortize its overhead.
 
   Activation functions are called between sparse matrix operations, so
@@ -171,6 +195,11 @@ def warmup(act, size, device, dtype, role="unknown"):
     _COMPILE_STATS["skipped_role"] += 1
     _set_eager(act)
     return False
+  if not _activation_should_compile(act):
+    _COMPILE_STATS["skipped_allowlist"] += 1
+    role_stats["skipped_allowlist"] += 1
+    _set_eager(act)
+    return False
   compile_forward = _config_bool("DDNMROM_ACT_COMPILE_FORWARD")
   compile_jac = _config_bool("DDNMROM_ACT_COMPILE_JAC")
   if not compile_forward and not compile_jac:
@@ -196,6 +225,7 @@ def warmup(act, size, device, dtype, role="unknown"):
   if isinstance(act, Mixed):
     signature = (signature, act._compile_signature())
   key = (
+    type(act).__name__,
     signature,
     device_key,
     dtype_key,
@@ -205,12 +235,46 @@ def warmup(act, size, device, dtype, role="unknown"):
   )
   compiled = _COMPILED_CACHE.get(key)
   cache_miss = compiled is None
+  if isinstance(act, Mixed) and cache_miss:
+    policy = cfg.get_config_val("DDNMROM_ACT_COMPILE_MIXED_POLICY").lower()
+    if policy not in ("all", "top_k"):
+      raise ValueError(
+        "DDNMROM_ACT_COMPILE_MIXED_POLICY must be 'all' or 'top_k', "
+        f"got {policy!r}"
+      )
+    layout_count = _MIXED_LAYOUT_COUNTS.get(signature, 0) + 1
+    _MIXED_LAYOUT_COUNTS[signature] = layout_count
+    min_frequency = int(
+      cfg.get_config_val("DDNMROM_ACT_COMPILE_MIXED_MIN_FREQUENCY")
+    )
+    if min_frequency < 1:
+      raise ValueError(
+        "DDNMROM_ACT_COMPILE_MIXED_MIN_FREQUENCY must be positive"
+      )
+    if policy == "top_k" and layout_count < min_frequency and not force:
+      _COMPILE_STATS["skipped_mixed_frequency"] += 1
+      role_stats["skipped_mixed_frequency"] += 1
+      _set_eager(act)
+      return False
   if cache_miss:
     # Static compilation creates one specialization per input shape. Retain
     # existing specializations, but avoid evicting and recompiling them when
     # a workload introduces too many unique shapes; those new shapes remain
     # on the eager path instead.
-    if len(_COMPILED_CACHE) >= _COMPILED_CACHE_MAXSIZE:
+    mixed_cache_size = int(
+      cfg.get_config_val("DDNMROM_ACT_COMPILE_MIXED_CACHE_MAXSIZE")
+    )
+    if mixed_cache_size < 1:
+      raise ValueError(
+        "DDNMROM_ACT_COMPILE_MIXED_CACHE_MAXSIZE must be positive"
+      )
+    cache_full = len(_COMPILED_CACHE) >= _COMPILED_CACHE_MAXSIZE
+    if isinstance(act, Mixed):
+      cache_full = cache_full or sum(
+        _is_mixed_cache_key(existing_key)
+        for existing_key in _COMPILED_CACHE
+      ) >= mixed_cache_size
+    if cache_full:
       _COMPILE_STATS["skipped_cache_full"] += 1
       role_stats["skipped_cache_full"] = role_stats.get("skipped_cache_full", 0) + 1
       _set_eager(act)
@@ -225,9 +289,12 @@ def warmup(act, size, device, dtype, role="unknown"):
     # Jacobian used by the Newton solve.
     compiled_fun = None
     compiled_fun_jac = None
-    compile_parts = (
-      act._torch_compile_parts(device) if isinstance(act, Mixed) else None
-    )
+    compile_parts = None
+    if isinstance(act, Mixed):
+      compile_parts = (
+        act._torch_compile_parts_for_size(device, size),
+        act._full_coverage(size),
+      )
     if compile_forward:
       if compile_parts is None:
         def fun(x, activation=act):
@@ -256,6 +323,7 @@ def warmup(act, size, device, dtype, role="unknown"):
   compiled_fun, compiled_fun_jac = compiled
   act.fun = compiled_fun if compiled_fun is not None else act._fun_torch
   act.jac = act._jac_torch
+  act._compiled_fun = compiled_fun
   act._compiled_fun_jac = compiled_fun_jac
   x = torch.zeros(size, device=device, dtype=dtype)
   if compiled_fun is not None:
@@ -296,6 +364,7 @@ def get(identifier='sigmoid', *args, **kwargs):
         act._jac = act._jac_torch
         act.fun = act._fun
         act.jac = act._jac_torch
+        act._compiled_fun = None
         act._compiled_fun_jac = None
     return act
   else:
@@ -310,15 +379,23 @@ class BaseAct(object):
   def __init__(self):
     self.fun = self._fun
     self.jac = lambda x: sp_diag(self._jac(x))
+    self._compiled_fun = None
     self._compiled_fun_jac = None
 
   def __call__(self, x, with_jac=True):
     return (self.fun(x), self.jac(x)) if with_jac else self.fun(x)
 
   def _call__torch(self, x, with_jac=True):
+    # ``get`` installs this method on BaseAct globally for the Torch backend.
+    # Direct NumPy activation objects can still be used after that happens,
+    # so keep their original eager dispatch when the input is not a Tensor.
+    if not torch.is_tensor(x):
+      return (self.fun(x), self.jac(x)) if with_jac else self.fun(x)
     if with_jac:
       if self._compiled_fun_jac is not None:
         return self._compiled_fun_jac(x)
+      if getattr(self, "_compiled_fun", None) is None:
+        return self._fun_jac_torch(x)
       return (self.fun(x), self.jac(x))
     else:
       return self.fun(x)
@@ -337,6 +414,9 @@ class BaseAct(object):
 
   def _jac_torch(self, x):
     raise NotImplementedError
+
+  def _fun_jac_torch(self, x):
+    return self._fun_torch(x), self._jac_torch(x)
 
   def _fun_jac(self, x):
     result = self._fun_torch(x)
@@ -448,8 +528,54 @@ class Mixed(BaseAct):
     # This avoids converting masks and creating indexing tensors on every
     # activation call.
     self._torch_masks = {}
+    self._torch_parts_cache = {}
+    coverage_indices = []
+    coverage_known = True
     for (act, mask) in masks.items():
-      self.masks[act] = (get(act), mask.reshape(-1))
+      if torch.is_tensor(mask):
+        if mask.dtype != torch.bool and mask.dtype not in (
+          torch.int8, torch.int16, torch.int32, torch.int64,
+          torch.uint8,
+        ):
+          raise TypeError(
+            "Mixed activation masks must have boolean or integer dtype"
+          )
+      else:
+        mask_array = np.asarray(mask)
+        if (
+          mask_array.dtype != np.bool_
+          and not np.issubdtype(mask_array.dtype, np.integer)
+        ):
+          raise TypeError(
+            "Mixed activation masks must have boolean or integer dtype"
+          )
+      mask = (
+        mask.reshape(-1) if hasattr(mask, "reshape")
+        else np.asarray(mask).reshape(-1)
+      )
+      self.masks[act] = (get(act), mask)
+      if torch.is_tensor(mask) and mask.device.type != "cpu":
+        coverage_known = False
+        continue
+      mask_array = (
+        mask.detach().cpu().numpy() if torch.is_tensor(mask)
+        else np.asarray(mask)
+      ).reshape(-1)
+      if mask_array.dtype == np.bool_:
+        mask_array = np.flatnonzero(mask_array)
+      coverage_indices.extend(
+        np.asarray(mask_array, dtype=np.int64).tolist()
+      )
+    if coverage_known:
+      unique_indices = np.unique(np.asarray(coverage_indices, dtype=np.int64))
+      self._coverage = (
+        len(coverage_indices),
+        len(unique_indices),
+        int(unique_indices[0]) if len(unique_indices) else None,
+        int(unique_indices[-1]) if len(unique_indices) else None,
+      )
+    else:
+      self._coverage = None
 
   def _torch_mask(self, act_id, mask, device):
     device_key = str(torch.device(device))
@@ -476,9 +602,72 @@ class Mixed(BaseAct):
     return indices
 
   def _torch_compile_parts(self, device):
-    return tuple(
-      (act, self._torch_mask(act_id, mask, device))
-      for act_id, (act, mask) in self.masks.items()
+    return self._torch_compile_parts_for_size(device, None)
+
+  def _torch_compile_parts_for_size(self, device, size):
+    parts = []
+    for act_id, (act, mask) in self.masks.items():
+      is_boolean = (
+        torch.is_tensor(mask) and mask.dtype == torch.bool
+      ) or (
+        not torch.is_tensor(mask)
+        and np.asarray(mask).dtype == np.bool_
+      )
+      if (
+        size is not None
+        and is_boolean
+        and int(mask.numel() if torch.is_tensor(mask) else np.size(mask))
+        != int(size)
+      ):
+        raise IndexError(
+          "Mixed activation boolean mask must match the input size"
+        )
+      parts.append(
+        (
+          act,
+          self._normalize_indices(
+            self._torch_mask(act_id, mask, device), size
+          ),
+        )
+      )
+    return tuple(parts)
+
+  @staticmethod
+  def _normalize_indices(indices, size):
+    """Match eager advanced-indexing rules for integer masks."""
+    if size is None or indices.numel() == 0:
+      return indices
+    invalid = (indices < -size) | (indices >= size)
+    if bool(torch.any(invalid)):
+      raise IndexError(
+        "Mixed activation mask index is out of bounds for input size "
+        f"{size}"
+      )
+    if bool(torch.any(indices < 0)):
+      return indices.remainder(size)
+    return indices
+
+  def _torch_parts(self, device, size):
+    device_key = str(torch.device(device))
+    cache_key = (device_key, int(size))
+    parts = self._torch_parts_cache.get(cache_key)
+    if parts is None:
+      parts = self._torch_compile_parts_for_size(device, int(size))
+      self._torch_parts_cache[cache_key] = parts
+    return parts
+
+  def _full_coverage(self, size):
+    """Return whether the masks form a disjoint partition of ``range(size)``."""
+    if self._coverage is None:
+      return False
+    count, unique_count, first, last = self._coverage
+    if size == 0:
+      return count == 0
+    return (
+      count == size
+      and unique_count == size
+      and first == 0
+      and last == size - 1
     )
 
   def _compile_signature(self):
@@ -518,20 +707,32 @@ class Mixed(BaseAct):
     return y
 
   def _fun_torch(self, x):
-    y = torch.clone(x)
-    for (act_id, (act, mask)) in self.masks.items():
-      indices = self._torch_mask(act_id, mask, x.device)
+    parts = self._torch_parts(x.device, x.numel())
+    y = torch.empty_like(x) if self._full_coverage(x.numel()) else torch.clone(x)
+    for act, indices in parts:
       values = act._fun_torch(x.index_select(0, indices))
       y.index_copy_(0, indices, values)
     return y
 
   def _jac_torch(self, x):
-    y = torch.zeros_like(x)
-    for (act_id, (act, mask)) in self.masks.items():
-      indices = self._torch_mask(act_id, mask, x.device)
+    parts = self._torch_parts(x.device, x.numel())
+    y = torch.empty_like(x) if self._full_coverage(x.numel()) else torch.zeros_like(x)
+    for act, indices in parts:
       values = act._jac_torch(x.index_select(0, indices))
       y.index_copy_(0, indices, values)
     return y
+
+  def _fun_jac_torch(self, x):
+    """Evaluate Mixed forward and derivative with one gather per mask."""
+    parts = self._torch_parts(x.device, x.numel())
+    full_coverage = self._full_coverage(x.numel())
+    y = torch.empty_like(x) if full_coverage else torch.clone(x)
+    dy = torch.empty_like(x) if full_coverage else torch.zeros_like(x)
+    for act, indices in parts:
+      values = x.index_select(0, indices)
+      y.index_copy_(0, indices, act._fun_torch(values))
+      dy.index_copy_(0, indices, act._jac_torch(values))
+    return y, dy
 
 # Softplus
 # -------------------------------------

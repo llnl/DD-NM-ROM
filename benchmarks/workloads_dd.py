@@ -10,6 +10,9 @@ each global domain size supported by the experiment.
 from __future__ import annotations
 
 import os
+import hashlib
+import random
+import statistics
 import time
 from pathlib import Path
 from typing import Any
@@ -288,11 +291,302 @@ def _activation_path(role: str, activation: Any) -> str:
     return f"{role}:{type(activation).__name__}"
 
 
+def _mixed_layout_id(activation: Any, width: int | None = None) -> str:
+    signature = repr((activation._compile_signature(), width)).encode()
+    return hashlib.sha256(signature).hexdigest()[:16]
+
+
+def _mixed_candidate_is_eligible(
+    candidate: dict[str, Any],
+    min_frequency: int,
+    min_size: int,
+    max_spread: float,
+) -> bool:
+    """Apply selection limits using production workload frequency."""
+    return (
+        candidate["workload_calls_per_pass"] >= min_frequency
+        and candidate["width"] >= min_size
+        and candidate["relative_spread"] <= max_spread
+    )
+
+
+def _sample_mixed_layouts(
+    inputs: list[tuple[str, Any, Any]],
+    with_jac: bool,
+    warmups: int,
+    repetitions: int,
+    batch_size: int,
+) -> list[dict[str, Any]]:
+    """Measure eager Mixed layouts before selecting compiled candidates.
+
+    Sampling deliberately warms every layout before timing it.  CUDA events
+    cover a small batch of calls so event creation and launch overhead do not
+    dominate the per-layout estimate.  A fixed local RNG changes the order on
+    every pass without making benchmark reports non-reproducible.
+    """
+    from dd_nm_rom import backend as bkd
+
+    candidates = {}
+    for role, activation, hidden in inputs:
+        if type(activation).__name__ != "Mixed":
+            continue
+        signature = (activation._compile_signature(), int(hidden.numel()))
+        candidate = candidates.setdefault(
+            signature,
+            {
+                "layout_id": _mixed_layout_id(activation, hidden.numel()),
+                "activation": activation,
+                "role": role,
+                "hidden": hidden,
+                "inputs": [],
+                "workload_calls_per_pass": 0,
+                "warmup_calls": 0,
+                "calls": 0,
+                "seconds": 0.0,
+                "sample_seconds_per_call": [],
+            },
+        )
+        candidate["inputs"].append((activation, hidden))
+        candidate["workload_calls_per_pass"] += 1
+
+    if not candidates or repetitions <= 0:
+        return []
+
+    is_cuda = (
+        bkd.is_torch_backend()
+        and getattr(bkd.device(), "type", str(bkd.device())) == "cuda"
+    )
+    ordered_candidates = list(candidates.values())
+    rng = random.Random(0)
+    outputs = []
+
+    def run_candidate(candidate, count):
+        for _ in range(count):
+            for activation, hidden in candidate["inputs"]:
+                outputs.append(activation(hidden, with_jac=with_jac))
+
+    # Warmups are intentionally excluded from both the call count and timing
+    # used for selection.  This removes first-use allocation and kernel setup
+    # costs from the ranking signal.
+    for _ in range(warmups):
+        rng.shuffle(ordered_candidates)
+        for candidate in ordered_candidates:
+            run_candidate(candidate, 1)
+            candidate["warmup_calls"] += len(candidate["inputs"])
+
+    if is_cuda:
+        import torch
+
+        torch.cuda.synchronize()
+    outputs.clear()
+
+    if is_cuda:
+        import torch
+
+        events = []
+        for _ in range(repetitions):
+            rng.shuffle(ordered_candidates)
+            for candidate in ordered_candidates:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                run_candidate(candidate, batch_size)
+                end.record()
+                batch_calls = len(candidate["inputs"]) * batch_size
+                events.append((candidate, start, end, batch_calls))
+                candidate["calls"] += batch_calls
+        torch.cuda.synchronize()
+        for candidate, start, end, batch_calls in events:
+            seconds = start.elapsed_time(end) / 1000.0
+            candidate["seconds"] += seconds
+            candidate["sample_seconds_per_call"].append(seconds / batch_calls)
+    else:
+        for _ in range(repetitions):
+            rng.shuffle(ordered_candidates)
+            for candidate in ordered_candidates:
+                start = time.perf_counter()
+                run_candidate(candidate, batch_size)
+                seconds = time.perf_counter() - start
+                batch_calls = len(candidate["inputs"]) * batch_size
+                candidate["seconds"] += seconds
+                candidate["sample_seconds_per_call"].append(seconds / batch_calls)
+                candidate["calls"] += batch_calls
+    del outputs
+
+    result = []
+    for candidate in candidates.values():
+        candidate = dict(candidate)
+        candidate.pop("inputs")
+        candidate["width"] = int(candidate["hidden"].numel())
+        candidate["mask_count"] = len(candidate["activation"].masks)
+        samples = candidate["sample_seconds_per_call"]
+        candidate["seconds_per_call"] = (
+            statistics.median(samples) if samples else 0.0
+        )
+        candidate["median_seconds_per_call"] = candidate["seconds_per_call"]
+        candidate["mean_seconds_per_call"] = (
+            statistics.mean(samples) if samples else 0.0
+        )
+        candidate["min_seconds_per_call"] = min(samples) if samples else 0.0
+        candidate["max_seconds_per_call"] = max(samples) if samples else 0.0
+        candidate["relative_spread"] = (
+            candidate["max_seconds_per_call"] / candidate["seconds_per_call"]
+            if candidate["seconds_per_call"] > 0.0 else float("inf")
+        )
+        candidate.pop("activation")
+        candidate.pop("hidden")
+        result.append(candidate)
+    return result
+
+
+def _prepare_mixed_compile_selection(
+    state: dict[str, Any],
+    inputs: list[tuple[str, Any, Any]],
+    with_jac: bool,
+) -> dict[str, Any] | None:
+    """Sample Mixed layouts and compile the highest-value candidates."""
+    from dd_nm_rom import backend as bkd
+    from dd_nm_rom import config as cfg
+    from dd_nm_rom.rom.nonlinear.autoencoder.nn_numpy import activation as activation_mod
+
+    if not bkd.is_torch_backend():
+        return None
+    if cfg.get_config_val("DDNMROM_ACT_COMPILE_MIXED_POLICY").lower() != "top_k":
+        return None
+    if not activation_mod._should_compile():
+        return None
+    if not (
+        activation_mod._config_bool("DDNMROM_ACT_COMPILE_FORWARD")
+        or activation_mod._config_bool("DDNMROM_ACT_COMPILE_JAC")
+    ):
+        return None
+    warmups = int(
+        cfg.get_config_val("DDNMROM_ACT_COMPILE_MIXED_SAMPLE_WARMUPS")
+    )
+    repetitions = int(
+        cfg.get_config_val("DDNMROM_ACT_COMPILE_MIXED_SAMPLE_REPETITIONS")
+    )
+    batch_size = int(
+        cfg.get_config_val("DDNMROM_ACT_COMPILE_MIXED_SAMPLE_BATCH_SIZE")
+    )
+    max_spread = float(
+        cfg.get_config_val("DDNMROM_ACT_COMPILE_MIXED_SAMPLE_MAX_SPREAD")
+    )
+    if warmups < 0:
+        raise ValueError(
+            "DDNMROM_ACT_COMPILE_MIXED_SAMPLE_WARMUPS must be nonnegative"
+        )
+    if repetitions < 1:
+        raise ValueError(
+            "DDNMROM_ACT_COMPILE_MIXED_SAMPLE_REPETITIONS must be positive"
+        )
+    if batch_size < 1:
+        raise ValueError(
+            "DDNMROM_ACT_COMPILE_MIXED_SAMPLE_BATCH_SIZE must be positive"
+        )
+    if max_spread <= 0.0:
+        raise ValueError(
+            "DDNMROM_ACT_COMPILE_MIXED_SAMPLE_MAX_SPREAD must be positive"
+        )
+
+    candidates = _sample_mixed_layouts(
+        inputs, with_jac, warmups, repetitions, batch_size
+    )
+    min_frequency = int(
+      cfg.get_config_val("DDNMROM_ACT_COMPILE_MIXED_MIN_FREQUENCY")
+    )
+    maxsize = int(
+      cfg.get_config_val("DDNMROM_ACT_COMPILE_MIXED_CACHE_MAXSIZE")
+    )
+    min_size = int(cfg.get_config_val("DDNMROM_ACT_COMPILE_MIN_SIZE"))
+    if min_frequency < 1:
+        raise ValueError(
+            "DDNMROM_ACT_COMPILE_MIXED_MIN_FREQUENCY must be positive"
+        )
+    if maxsize < 1:
+        raise ValueError(
+            "DDNMROM_ACT_COMPILE_MIXED_CACHE_MAXSIZE must be positive"
+        )
+    eligible = [
+        candidate for candidate in candidates
+        if _mixed_candidate_is_eligible(
+            candidate, min_frequency, min_size, max_spread
+        )
+    ]
+    for candidate in candidates:
+        candidate["stable"] = candidate["relative_spread"] <= max_spread
+        candidate["selection_score"] = (
+            candidate["workload_calls_per_pass"]
+            * candidate["median_seconds_per_call"]
+        )
+        candidate["selected"] = False
+        candidate["selection_rank"] = None
+
+    # Rank by expected workload frequency times robust steady-state eager
+    # cost.  Sampling calls are intentionally not used as frequency because
+    # every layout receives the same number of sample repetitions.
+    eligible.sort(
+        key=lambda candidate: (
+            candidate["selection_score"],
+            candidate["width"],
+        ),
+        reverse=True,
+    )
+    selected = eligible[:maxsize]
+    selected_ids = {candidate["layout_id"] for candidate in selected}
+    for rank, candidate in enumerate(selected, start=1):
+        candidate["selected"] = True
+        candidate["selection_rank"] = rank
+
+    for role, activation, hidden in inputs:
+        if type(activation).__name__ != "Mixed":
+            continue
+        if _mixed_layout_id(activation, hidden.numel()) not in selected_ids:
+            continue
+        activation_mod.warmup(
+            activation,
+            int(hidden.numel()),
+            device=hidden.device,
+            dtype=hidden.dtype,
+            role=role,
+            force=True,
+        )
+
+    if bkd.is_torch_backend() and getattr(bkd.device(), "type", str(bkd.device())) == "cuda":
+        import torch
+
+        torch.cuda.synchronize()
+
+    report = {
+        "sample_warmups": warmups,
+        "sample_repetitions": repetitions,
+        "sample_batch_size": batch_size,
+        "sample_max_spread": max_spread,
+        "candidate_layouts": len(candidates),
+        "eligible_layouts": len(eligible),
+        "selected_layouts": len(selected),
+        "by_layout": {
+            candidate["layout_id"]: {
+                key: value for key, value in candidate.items()
+                if key not in ("layout_id",)
+            }
+            for candidate in candidates
+        },
+    }
+    state["dd_rom"].activation_compile_stats = activation_mod.get_compile_stats()
+    return report
+
+
 def dd_rom_activation_prepare(config: dict[str, Any]) -> dict[str, Any]:
     """Prepare the same DD-ROM workload for activation-only profiling."""
     state = dd_rom_prepare(config)
     state["activation_inputs"] = _decoder_activation_inputs(
         state["dd_rom"], state["x0"]
+    )
+    state["activation_compile_mixed_sampling"] = _prepare_mixed_compile_selection(
+        state,
+        state["activation_inputs"],
+        bool(config.get("activation_with_jac", True)),
     )
     return state
 
@@ -372,6 +666,9 @@ def dd_rom_activation_run(state: dict[str, Any]) -> dict[str, Any]:
         "activation_elements": activation_elements,
         "activation_with_jac": with_jac,
         "activation_by_path": by_path,
+        "activation_compile_mixed_sampling": state.get(
+            "activation_compile_mixed_sampling"
+        ),
         "activation_compile": state["dd_rom"].activation_compile_stats,
     }
 

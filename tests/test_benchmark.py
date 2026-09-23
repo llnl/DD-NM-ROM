@@ -68,3 +68,26 @@ def test_activation_path_key_uses_role_and_activation_type():
     pass
 
   assert workloads_dd._activation_path("decoder", Softplus()) == "decoder:Softplus"
+
+
+def test_mixed_candidate_frequency_uses_workload_calls():
+  candidate = {
+    "workload_calls_per_pass": 1,
+    "calls": 8,
+    "width": 8192,
+    "relative_spread": 1.0,
+  }
+  assert not workloads_dd._mixed_candidate_is_eligible(
+    candidate, min_frequency=2, min_size=4096, max_spread=4.0
+  )
+
+  candidate["workload_calls_per_pass"] = 2
+  assert workloads_dd._mixed_candidate_is_eligible(
+    candidate, min_frequency=2, min_size=4096, max_spread=4.0
+  )
+
+
+def test_activation_compiler_module_import_path():
+  from dd_nm_rom.rom.nonlinear.autoencoder.nn_numpy import activation
+
+  assert hasattr(activation, "warmup")

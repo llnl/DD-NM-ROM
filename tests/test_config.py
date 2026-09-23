@@ -11,6 +11,14 @@ def test_config_snapshot_reports_defaults_and_extra_environment(monkeypatch):
     "DDNMROM_ACT_COMPILE_DECODER",
     "DDNMROM_ACT_COMPILE_FORWARD",
     "DDNMROM_ACT_COMPILE_JAC",
+    "DDNMROM_ACT_COMPILE_ACTIVATIONS",
+    "DDNMROM_ACT_COMPILE_MIXED_POLICY",
+    "DDNMROM_ACT_COMPILE_MIXED_CACHE_MAXSIZE",
+    "DDNMROM_ACT_COMPILE_MIXED_MIN_FREQUENCY",
+    "DDNMROM_ACT_COMPILE_MIXED_SAMPLE_WARMUPS",
+    "DDNMROM_ACT_COMPILE_MIXED_SAMPLE_REPETITIONS",
+    "DDNMROM_ACT_COMPILE_MIXED_SAMPLE_BATCH_SIZE",
+    "DDNMROM_ACT_COMPILE_MIXED_SAMPLE_MAX_SPREAD",
   ):
     monkeypatch.delenv(var, raising=False)
   monkeypatch.setenv("DDNMROM_BENCHMARK_ENV_PROFILE", "benchmarks/env/tuo.bash")
@@ -27,6 +35,14 @@ def test_config_snapshot_reports_defaults_and_extra_environment(monkeypatch):
   assert registered["DDNMROM_ACT_COMPILE_DECODER"]["value"] is True
   assert registered["DDNMROM_ACT_COMPILE_FORWARD"]["value"] is False
   assert registered["DDNMROM_ACT_COMPILE_JAC"]["value"] is True
+  assert registered["DDNMROM_ACT_COMPILE_ACTIVATIONS"]["value"] == "all"
+  assert registered["DDNMROM_ACT_COMPILE_MIXED_POLICY"]["value"] == "all"
+  assert registered["DDNMROM_ACT_COMPILE_MIXED_CACHE_MAXSIZE"]["value"] == 32
+  assert registered["DDNMROM_ACT_COMPILE_MIXED_MIN_FREQUENCY"]["value"] == 1
+  assert registered["DDNMROM_ACT_COMPILE_MIXED_SAMPLE_WARMUPS"]["value"] == 2
+  assert registered["DDNMROM_ACT_COMPILE_MIXED_SAMPLE_REPETITIONS"]["value"] == 8
+  assert registered["DDNMROM_ACT_COMPILE_MIXED_SAMPLE_BATCH_SIZE"]["value"] == 4
+  assert registered["DDNMROM_ACT_COMPILE_MIXED_SAMPLE_MAX_SPREAD"]["value"] == 4.0
   assert snapshot["extra_environment"]["DDNMROM_BENCHMARK_ENV_PROFILE"] == \
     "benchmarks/env/tuo.bash"
   assert snapshot["fingerprint"].startswith("sha256:")

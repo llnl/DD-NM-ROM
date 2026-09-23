@@ -137,6 +137,64 @@ def test_mixed_torch_activation_uses_device_indices():
     {"softplus", "relu"}
 
 
+def test_mixed_jacobian_can_be_compiled(monkeypatch):
+  calls = []
+
+  monkeypatch.setattr(
+    torch,
+    "compile",
+    lambda fun, **kwargs: calls.append((fun, kwargs)) or fun,
+    raising=True,
+  )
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
+
+  masks = {
+    "softplus": np.array([0, 2, 5]),
+    "relu": np.array([1, 3, 4]),
+  }
+  act = activation.get("mixed", masks=masks)
+  assert activation.warmup(
+    act, 8192, "cpu", torch.float32, role="decoder"
+  ) is True
+
+  x = torch.randn(8192)
+  actual, actual_jac = act(x, with_jac=True)
+  expected = act._fun_torch(x)
+  expected_jac = act._jac_torch(x)
+  assert len(calls) == 1
+  assert torch.allclose(actual, expected)
+  assert torch.allclose(actual_jac, expected_jac)
+  assert activation.get_compile_stats()["skipped_mixed"] == 0
+
+
+def test_mixed_compile_cache_includes_mask_layout(monkeypatch):
+  calls = []
+
+  monkeypatch.setattr(
+    torch,
+    "compile",
+    lambda fun, **kwargs: calls.append((fun, kwargs)) or fun,
+    raising=True,
+  )
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
+
+  first = activation.get(
+    "mixed",
+    masks={"softplus": np.array([0, 1]), "relu": np.array([2, 3])},
+  )
+  second = activation.get(
+    "mixed",
+    masks={"softplus": np.array([0, 2]), "relu": np.array([1, 3])},
+  )
+  assert activation.warmup(first, 8192, "cpu", torch.float32, role="decoder")
+  assert activation.warmup(second, 8192, "cpu", torch.float32, role="decoder")
+  assert len(calls) == 2
+
+
 def test_activation_compile_flag_controls_torch_compile(monkeypatch):
   calls = []
 
@@ -310,8 +368,8 @@ def test_small_and_trivial_activations_stay_eager(monkeypatch):
 
   assert activation.warmup(activation.get("softplus"), 4095, "cpu", torch.float32) is False
   assert activation.warmup(activation.get("linear"), 8192, "cpu", torch.float32) is False
-  assert activation.warmup(activation.get("mixed", masks={}), 8192, "cpu", torch.float32) is False
-  assert calls == []
+  assert activation.warmup(activation.get("mixed", masks={}), 8192, "cpu", torch.float32) is True
+  assert len(calls) == 1
 
 
 def test_cpu_uses_eager_activations_by_default(monkeypatch):

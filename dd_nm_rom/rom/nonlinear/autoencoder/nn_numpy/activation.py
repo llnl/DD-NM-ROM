@@ -121,6 +121,24 @@ def _set_eager(act):
   act._compiled_fun_jac = None
 
 
+def _mixed_fun_from_parts(x, parts):
+  y = torch.clone(x)
+  for act, indices in parts:
+    values = act._fun_torch(x.index_select(0, indices))
+    y.index_copy_(0, indices, values)
+  return y
+
+
+def _mixed_fun_jac_from_parts(x, parts):
+  y = torch.clone(x)
+  dy = torch.zeros_like(x)
+  for act, indices in parts:
+    values = x.index_select(0, indices)
+    y.index_copy_(0, indices, act._fun_torch(values))
+    dy.index_copy_(0, indices, act._jac_torch(values))
+  return y, dy
+
+
 def warmup(act, size, device, dtype, role="unknown"):
   """Bind and warm an activation when compilation can amortize its overhead.
 
@@ -168,14 +186,6 @@ def warmup(act, size, device, dtype, role="unknown"):
     _COMPILE_STATS["skipped_linear"] += 1
     _set_eager(act)
     return False
-  if isinstance(act, Mixed):
-    _COMPILE_STATS["skipped_mixed"] += 1
-    # Linear activations have no useful work to optimize. Mixed activations
-    # contain Python-level masked indexing and are deliberately kept as one
-    # eager operation rather than partially compiling their components.
-    _set_eager(act)
-    return False
-
   _COMPILE_STATS["eligible_calls"] += 1
   role_stats["eligible_calls"] += 1
 
@@ -183,6 +193,8 @@ def warmup(act, size, device, dtype, role="unknown"):
   dtype_key = str(dtype)
   input_shape = (size,)
   signature = (type(act).__name__, getattr(act, "alpha", None))
+  if isinstance(act, Mixed):
+    signature = (signature, act._compile_signature())
   key = (
     signature,
     device_key,
@@ -213,13 +225,24 @@ def warmup(act, size, device, dtype, role="unknown"):
     # Jacobian used by the Newton solve.
     compiled_fun = None
     compiled_fun_jac = None
+    compile_parts = (
+      act._torch_compile_parts(device) if isinstance(act, Mixed) else None
+    )
     if compile_forward:
-      def fun(x, activation=act):
-        return activation._fun_torch(x)
+      if compile_parts is None:
+        def fun(x, activation=act):
+          return activation._fun_torch(x)
+      else:
+        def fun(x, parts=compile_parts):
+          return _mixed_fun_from_parts(x, parts)
       compiled_fun = _maybe_compile(fun)
     if compile_jac:
-      def fun_jac(x, activation=act):
-        return activation._fun_torch(x), activation._jac_torch(x)
+      if compile_parts is None:
+        def fun_jac(x, activation=act):
+          return activation._fun_torch(x), activation._jac_torch(x)
+      else:
+        def fun_jac(x, parts=compile_parts):
+          return _mixed_fun_jac_from_parts(x, parts)
       compiled_fun_jac = _maybe_compile(fun_jac)
 
     compiled = (compiled_fun, compiled_fun_jac)
@@ -451,6 +474,36 @@ class Mixed(BaseAct):
         )
       device_masks[act_id] = indices
     return indices
+
+  def _torch_compile_parts(self, device):
+    return tuple(
+      (act, self._torch_mask(act_id, mask, device))
+      for act_id, (act, mask) in self.masks.items()
+    )
+
+  def _compile_signature(self):
+    signature = []
+    for act_id, (act, mask) in self.masks.items():
+      if torch.is_tensor(mask):
+        mask = mask.detach().to(device="cpu").reshape(-1)
+        if mask.dtype == torch.bool:
+          indices = torch.nonzero(mask, as_tuple=False).reshape(-1).tolist()
+        else:
+          indices = mask.to(dtype=torch.long).tolist()
+      else:
+        mask_array = np.asarray(mask).reshape(-1)
+        if mask_array.dtype == np.bool_:
+          mask_array = np.flatnonzero(mask_array)
+        indices = np.asarray(mask_array, dtype=np.int64).tolist()
+      signature.append(
+        (
+          act_id,
+          type(act).__name__,
+          getattr(act, "alpha", None),
+          tuple(int(index) for index in indices),
+        )
+      )
+    return tuple(signature)
 
   def _fun(self, x):
     y = copy.deepcopy(x)

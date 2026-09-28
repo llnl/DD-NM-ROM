@@ -14,6 +14,7 @@ import hashlib
 import random
 import statistics
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -310,6 +311,76 @@ def _mixed_candidate_is_eligible(
     )
 
 
+def _inference_context(bkd):
+    """Return a no-autograd context for Torch activation-only work."""
+    if bkd.is_torch_backend():
+        import torch
+
+        return torch.inference_mode()
+    return nullcontext()
+
+
+def _aggregate_mixed_candidates(candidates, bkd):
+    """Make Mixed-layout measurements and ranking identical across ranks."""
+    if not bkd.distributed():
+        for candidate in candidates:
+            candidate["rank_count"] = 1
+        return candidates
+
+    fields = (
+        "layout_id", "role", "width", "mask_count",
+        "workload_calls_per_pass", "warmup_calls", "calls", "seconds",
+        "sample_seconds_per_call",
+    )
+    local = [{key: candidate[key] for key in fields} for candidate in candidates]
+    gathered = bkd._COMM.allgather(local)
+    merged = {}
+    for rank_records in gathered:
+        for record in rank_records:
+            layout_id = record["layout_id"]
+            candidate = merged.get(layout_id)
+            if candidate is None:
+                candidate = {
+                    key: record[key] for key in fields
+                    if key != "sample_seconds_per_call"
+                }
+                candidate["sample_seconds_per_call"] = list(
+                    record["sample_seconds_per_call"]
+                )
+                merged[layout_id] = candidate
+                continue
+            if candidate["role"] != record["role"]:
+                # The layout ID does not include the model role. Keep the
+                # deterministic lexical choice for reporting and compilation.
+                candidate["role"] = min(candidate["role"], record["role"])
+            candidate["workload_calls_per_pass"] += record["workload_calls_per_pass"]
+            candidate["calls"] += record["calls"]
+            candidate["seconds"] += record["seconds"]
+            candidate["sample_seconds_per_call"].extend(
+                record["sample_seconds_per_call"]
+            )
+
+    # Rank count is tracked separately so layouts absent on a rank can be
+    # excluded from a synchronized compile set.
+    for layout_id, candidate in merged.items():
+        records_present = sum(
+            layout_id in {record["layout_id"] for record in rank_records}
+            for rank_records in gathered
+        )
+        candidate["rank_count"] = records_present
+        samples = candidate["sample_seconds_per_call"]
+        candidate["seconds_per_call"] = statistics.median(samples) if samples else 0.0
+        candidate["median_seconds_per_call"] = candidate["seconds_per_call"]
+        candidate["mean_seconds_per_call"] = statistics.mean(samples) if samples else 0.0
+        candidate["min_seconds_per_call"] = min(samples) if samples else 0.0
+        candidate["max_seconds_per_call"] = max(samples) if samples else 0.0
+        candidate["relative_spread"] = (
+            candidate["max_seconds_per_call"] / candidate["seconds_per_call"]
+            if candidate["seconds_per_call"] > 0.0 else float("inf")
+        )
+    return list(merged.values())
+
+
 def _sample_mixed_layouts(
     inputs: list[tuple[str, Any, Any]],
     with_jac: bool,
@@ -358,60 +429,59 @@ def _sample_mixed_layouts(
     )
     ordered_candidates = list(candidates.values())
     rng = random.Random(0)
-    outputs = []
 
     def run_candidate(candidate, count):
         for _ in range(count):
             for activation, hidden in candidate["inputs"]:
-                outputs.append(activation(hidden, with_jac=with_jac))
+                result = activation(hidden, with_jac=with_jac)
+                del result
 
-    # Warmups are intentionally excluded from both the call count and timing
-    # used for selection.  This removes first-use allocation and kernel setup
-    # costs from the ranking signal.
-    for _ in range(warmups):
-        rng.shuffle(ordered_candidates)
-        for candidate in ordered_candidates:
-            run_candidate(candidate, 1)
-            candidate["warmup_calls"] += len(candidate["inputs"])
-
-    if is_cuda:
-        import torch
-
-        torch.cuda.synchronize()
-    outputs.clear()
-
-    if is_cuda:
-        import torch
-
-        events = []
-        for _ in range(repetitions):
+    with _inference_context(bkd):
+        # Warmups are intentionally excluded from both the call count and
+        # timing used for selection. This removes first-use allocation and
+        # kernel setup costs from the ranking signal.
+        for _ in range(warmups):
             rng.shuffle(ordered_candidates)
             for candidate in ordered_candidates:
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                run_candidate(candidate, batch_size)
-                end.record()
-                batch_calls = len(candidate["inputs"]) * batch_size
-                events.append((candidate, start, end, batch_calls))
-                candidate["calls"] += batch_calls
-        torch.cuda.synchronize()
-        for candidate, start, end, batch_calls in events:
-            seconds = start.elapsed_time(end) / 1000.0
-            candidate["seconds"] += seconds
-            candidate["sample_seconds_per_call"].append(seconds / batch_calls)
-    else:
-        for _ in range(repetitions):
-            rng.shuffle(ordered_candidates)
-            for candidate in ordered_candidates:
-                start = time.perf_counter()
-                run_candidate(candidate, batch_size)
-                seconds = time.perf_counter() - start
-                batch_calls = len(candidate["inputs"]) * batch_size
+                run_candidate(candidate, 1)
+                candidate["warmup_calls"] += len(candidate["inputs"])
+
+        if is_cuda:
+            import torch
+
+            torch.cuda.synchronize()
+
+        if is_cuda:
+            import torch
+
+            events = []
+            for _ in range(repetitions):
+                rng.shuffle(ordered_candidates)
+                for candidate in ordered_candidates:
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    run_candidate(candidate, batch_size)
+                    end.record()
+                    batch_calls = len(candidate["inputs"]) * batch_size
+                    events.append((candidate, start, end, batch_calls))
+                    candidate["calls"] += batch_calls
+            torch.cuda.synchronize()
+            for candidate, start, end, batch_calls in events:
+                seconds = start.elapsed_time(end) / 1000.0
                 candidate["seconds"] += seconds
                 candidate["sample_seconds_per_call"].append(seconds / batch_calls)
-                candidate["calls"] += batch_calls
-    del outputs
+        else:
+            for _ in range(repetitions):
+                rng.shuffle(ordered_candidates)
+                for candidate in ordered_candidates:
+                    start = time.perf_counter()
+                    run_candidate(candidate, batch_size)
+                    seconds = time.perf_counter() - start
+                    batch_calls = len(candidate["inputs"]) * batch_size
+                    candidate["seconds"] += seconds
+                    candidate["sample_seconds_per_call"].append(seconds / batch_calls)
+                    candidate["calls"] += batch_calls
 
     result = []
     for candidate in candidates.values():
@@ -489,9 +559,19 @@ def _prepare_mixed_compile_selection(
             "DDNMROM_ACT_COMPILE_MIXED_SAMPLE_MAX_SPREAD must be positive"
         )
 
-    candidates = _sample_mixed_layouts(
+    # Model construction may have compiled a different set of Mixed layouts.
+    # Sampling must see eager callables, and selected layouts must start with
+    # predictable cache capacity and frequency accounting.
+    for _, activation, _ in inputs:
+        if isinstance(activation, activation_mod.Mixed):
+            activation_mod._set_eager(activation)
+    activation_mod.clear_compiled_cache(mixed_only=True)
+    activation_mod.reset_mixed_compile_state()
+
+    local_candidates = _sample_mixed_layouts(
         inputs, with_jac, warmups, repetitions, batch_size
     )
+    candidates = _aggregate_mixed_candidates(local_candidates, bkd)
     min_frequency = int(
       cfg.get_config_val("DDNMROM_ACT_COMPILE_MIXED_MIN_FREQUENCY")
     )
@@ -512,6 +592,7 @@ def _prepare_mixed_compile_selection(
         if _mixed_candidate_is_eligible(
             candidate, min_frequency, min_size, max_spread
         )
+        and candidate.get("rank_count", 1) >= bkd.get_nranks()
     ]
     for candidate in candidates:
         candidate["stable"] = candidate["relative_spread"] <= max_spread
@@ -532,30 +613,67 @@ def _prepare_mixed_compile_selection(
         ),
         reverse=True,
     )
-    selected = eligible[:maxsize]
+    available_slots = activation_mod.compiled_cache_slots_available()
+    if bkd.distributed():
+        available_slots = min(
+            bkd._COMM.allgather(available_slots)
+        )
+    selection_limit = min(maxsize, available_slots)
+    selected = eligible[:selection_limit]
     selected_ids = {candidate["layout_id"] for candidate in selected}
     for rank, candidate in enumerate(selected, start=1):
         candidate["selected"] = True
         candidate["selection_rank"] = rank
 
-    for role, activation, hidden in inputs:
-        if type(activation).__name__ != "Mixed":
-            continue
-        if _mixed_layout_id(activation, hidden.numel()) not in selected_ids:
-            continue
-        activation_mod.warmup(
-            activation,
-            int(hidden.numel()),
-            device=hidden.device,
-            dtype=hidden.dtype,
-            role=role,
-            force=True,
+    # Compile every selected layout on every rank. Compile errors are
+    # exchanged before any rank proceeds to a later distributed collective;
+    # otherwise one rank can fail while another enters the solver and hangs.
+    compile_exception = None
+    try:
+        with _inference_context(bkd):
+            for role, activation, hidden in inputs:
+                if type(activation).__name__ != "Mixed":
+                    continue
+                if _mixed_layout_id(activation, hidden.numel()) not in selected_ids:
+                    continue
+                activation_mod.warmup(
+                    activation,
+                    int(hidden.numel()),
+                    device=hidden.device,
+                    dtype=hidden.dtype,
+                    role=role,
+                    force=True,
+                )
+
+            if (
+                bkd.is_torch_backend()
+                and getattr(bkd.device(), "type", str(bkd.device())) == "cuda"
+            ):
+                import torch
+
+                torch.cuda.synchronize()
+    except Exception as exc:
+        compile_exception = exc
+
+    if bkd.distributed():
+        compile_errors = bkd._COMM.allgather(
+            None if compile_exception is None else repr(compile_exception)
         )
+        if any(error is not None for error in compile_errors):
+            details = "; ".join(
+                "rank {}: {}".format(rank, error)
+                for rank, error in enumerate(compile_errors)
+                if error is not None
+            )
+            raise RuntimeError(
+                "DDNMROM Mixed activation compilation failed before "
+                "synchronization: " + details
+            ) from compile_exception
+    elif compile_exception is not None:
+        raise compile_exception
 
-    if bkd.is_torch_backend() and getattr(bkd.device(), "type", str(bkd.device())) == "cuda":
-        import torch
-
-        torch.cuda.synchronize()
+    if selected_ids:
+        bkd.barrier()
 
     report = {
         "sample_warmups": warmups,
@@ -565,6 +683,7 @@ def _prepare_mixed_compile_selection(
         "candidate_layouts": len(candidates),
         "eligible_layouts": len(eligible),
         "selected_layouts": len(selected),
+        "available_cache_slots": available_slots,
         "by_layout": {
             candidate["layout_id"]: {
                 key: value for key, value in candidate.items()
@@ -623,43 +742,39 @@ def dd_rom_activation_run(state: dict[str, Any]) -> dict[str, Any]:
         )
         grouped_inputs.setdefault(path, []).append((activation, hidden))
 
-    if is_cuda:
-        import torch
+    with _inference_context(bkd):
+        if is_cuda:
+            import torch
 
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        outputs = []
-        path_events = []
-        for path, path_inputs in grouped_inputs.items():
-            path_start = torch.cuda.Event(enable_timing=True)
-            path_end = torch.cuda.Event(enable_timing=True)
-            path_start.record()
-            outputs.extend(
-                activation(hidden, with_jac=with_jac)
-                for activation, hidden in path_inputs
-            )
-            path_end.record()
-            path_events.append((path, path_start, path_end))
-        end.record()
-        end.synchronize()
-        elapsed = start.elapsed_time(end) / 1000.0
-        for path, path_start, path_end in path_events:
-            by_path[path]["seconds"] = path_start.elapsed_time(path_end) / 1000.0
-    else:
-        start_time = time.perf_counter()
-        outputs = []
-        for path, path_inputs in grouped_inputs.items():
-            path_start = time.perf_counter()
-            outputs.extend(
-                activation(hidden, with_jac=with_jac)
-                for activation, hidden in path_inputs
-            )
-            by_path[path]["seconds"] = time.perf_counter() - path_start
-        elapsed = time.perf_counter() - start_time
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            path_events = []
+            for path, path_inputs in grouped_inputs.items():
+                path_start = torch.cuda.Event(enable_timing=True)
+                path_end = torch.cuda.Event(enable_timing=True)
+                path_start.record()
+                for activation, hidden in path_inputs:
+                    result = activation(hidden, with_jac=with_jac)
+                    del result
+                path_end.record()
+                path_events.append((path, path_start, path_end))
+            end.record()
+            end.synchronize()
+            elapsed = start.elapsed_time(end) / 1000.0
+            for path, path_start, path_end in path_events:
+                by_path[path]["seconds"] = path_start.elapsed_time(path_end) / 1000.0
+        else:
+            start_time = time.perf_counter()
+            for path, path_inputs in grouped_inputs.items():
+                path_start = time.perf_counter()
+                for activation, hidden in path_inputs:
+                    result = activation(hidden, with_jac=with_jac)
+                    del result
+                by_path[path]["seconds"] = time.perf_counter() - path_start
+            elapsed = time.perf_counter() - start_time
 
-    del outputs
     return {
         "activation_timing_seconds": elapsed,
         "activation_calls": len(inputs),

@@ -135,6 +135,32 @@ def _is_mixed_cache_key(key):
   return key[0] == "Mixed"
 
 
+def clear_compiled_cache(mixed_only=False):
+  """Remove cached Torch callables, optionally retaining pure activations.
+
+  Mixed-layout selection samples eager activations and then reserves cache
+  entries for the layouts it chooses.  Keeping stale Mixed entries from model
+  construction would make that reservation depend on whichever layouts were
+  encountered first.
+  """
+  if mixed_only:
+    keys = [key for key in _COMPILED_CACHE if _is_mixed_cache_key(key)]
+  else:
+    keys = list(_COMPILED_CACHE)
+  for key in keys:
+    _COMPILED_CACHE.pop(key, None)
+
+
+def reset_mixed_compile_state():
+  """Reset workload-local Mixed layout frequency bookkeeping."""
+  _MIXED_LAYOUT_COUNTS.clear()
+
+
+def compiled_cache_slots_available():
+  """Return the number of free entries in the shared compile cache."""
+  return max(0, _COMPILED_CACHE_MAXSIZE - len(_COMPILED_CACHE))
+
+
 def _set_eager(act):
   """Restore an activation object to its eager Torch callables."""
   act.fun = act._fun_torch
@@ -144,7 +170,23 @@ def _set_eager(act):
 
 
 def _mixed_fun_from_parts(x, parts):
-  activation_parts, full_coverage = parts
+  activation_parts, full_coverage, packed_plan = parts
+  if packed_plan is not None:
+    order, packed_groups, identity = packed_plan
+    # A full DD-ROM Mixed layout can be evaluated in activation-group order,
+    # reducing K gathers/scatters to one gather/scatter for K activation types.
+    if identity:
+      y = torch.empty_like(x)
+      for act, start, end in packed_groups:
+        y[start:end] = act._fun_torch(x[start:end])
+      return y
+
+    grouped = x.index_select(0, order)
+    for act, start, end in packed_groups:
+      grouped[start:end] = act._fun_torch(grouped[start:end])
+    y = torch.empty_like(x)
+    return y.index_copy_(0, order, grouped)
+
   y = torch.empty_like(x) if full_coverage else torch.clone(x)
   for act, indices in activation_parts:
     values = act._fun_torch(x.index_select(0, indices))
@@ -153,13 +195,37 @@ def _mixed_fun_from_parts(x, parts):
 
 
 def _mixed_fun_jac_from_parts(x, parts):
-  activation_parts, full_coverage = parts
+  activation_parts, full_coverage, packed_plan = parts
+  if packed_plan is not None:
+    order, packed_groups, identity = packed_plan
+    if identity:
+      y = torch.empty_like(x)
+      dy = torch.empty_like(x)
+      for act, start, end in packed_groups:
+        values, derivatives = act._fun_jac_torch(x[start:end])
+        y[start:end] = values
+        dy[start:end] = derivatives
+      return y, dy
+
+    grouped = x.index_select(0, order)
+    dy_grouped = torch.empty_like(grouped)
+    for act, start, end in packed_groups:
+      values, derivatives = act._fun_jac_torch(grouped[start:end])
+      grouped[start:end] = values
+      dy_grouped[start:end] = derivatives
+    y = torch.empty_like(x)
+    dy = torch.empty_like(x)
+    y.index_copy_(0, order, grouped)
+    dy.index_copy_(0, order, dy_grouped)
+    return y, dy
+
   y = torch.empty_like(x) if full_coverage else torch.clone(x)
   dy = torch.empty_like(x) if full_coverage else torch.zeros_like(x)
   for act, indices in activation_parts:
     values = x.index_select(0, indices)
-    y.index_copy_(0, indices, act._fun_torch(values))
-    dy.index_copy_(0, indices, act._jac_torch(values))
+    result, derivative = act._fun_jac_torch(values)
+    y.index_copy_(0, indices, result)
+    dy.index_copy_(0, indices, derivative)
   return y, dy
 
 
@@ -291,9 +357,11 @@ def warmup(act, size, device, dtype, role="unknown", force=False):
     compiled_fun_jac = None
     compile_parts = None
     if isinstance(act, Mixed):
+      activation_parts = act._torch_compile_parts_for_size(device, size)
       compile_parts = (
-        act._torch_compile_parts_for_size(device, size),
+        activation_parts,
         act._full_coverage(size),
+        act._torch_packed_plan(device, size, activation_parts),
       )
     if compile_forward:
       if compile_parts is None:
@@ -303,10 +371,11 @@ def warmup(act, size, device, dtype, role="unknown", force=False):
         def fun(x, parts=compile_parts):
           return _mixed_fun_from_parts(x, parts)
       compiled_fun = _maybe_compile(fun)
+
     if compile_jac:
       if compile_parts is None:
         def fun_jac(x, activation=act):
-          return activation._fun_torch(x), activation._jac_torch(x)
+          return activation._fun_jac_torch(x)
       else:
         def fun_jac(x, parts=compile_parts):
           return _mixed_fun_jac_from_parts(x, parts)
@@ -394,9 +463,9 @@ class BaseAct(object):
     if with_jac:
       if self._compiled_fun_jac is not None:
         return self._compiled_fun_jac(x)
-      if getattr(self, "_compiled_fun", None) is None:
-        return self._fun_jac_torch(x)
-      return (self.fun(x), self.jac(x))
+      # A forward-only compiled callable cannot share intermediates with the
+      # Jacobian. Prefer the fused eager pair over running two paths.
+      return self._fun_jac_torch(x)
     else:
       return self.fun(x)
 
@@ -438,17 +507,30 @@ class Linear(BaseAct):
   def _jac_torch(self, x):
     return torch.ones_like(x)
 
+  def _fun_jac_torch(self, x):
+    return x, torch.ones_like(x)
+
 
 # Sigmoid
 # -------------------------------------
+def _numpy_sigmoid(x):
+  x = np.asarray(x)
+  exp_neg_abs = np.exp(-np.abs(x))
+  return np.where(
+    x >= 0.0,
+    1.0 / (1.0 + exp_neg_abs),
+    exp_neg_abs / (1.0 + exp_neg_abs),
+  )
+
+
 class Sigmoid(BaseAct):
 
   def _fun(self, x):
-    return 1.0 / (1.0+np.exp(-x))
+    return _numpy_sigmoid(x)
 
   def _jac(self, x):
-    ex = np.exp(-x)
-    return ex / (1.0+ex)**2
+    fx = self._fun(x)
+    return fx * (1.0 - fx)
 
   def _fun_torch(self, x):
     return torch.sigmoid(x)
@@ -457,44 +539,51 @@ class Sigmoid(BaseAct):
     fx = torch.sigmoid(x)
     return fx * (1.0 - fx)
 
+  def _fun_jac_torch(self, x):
+    fx = torch.sigmoid(x)
+    return fx, fx * (1.0 - fx)
+
 # Swish
 # -------------------------------------
 class Swish(BaseAct):
 
   def _fun(self, x):
-    return x / (1.0 + np.exp(-x))
+    fx = _numpy_sigmoid(x)
+    return x * fx
 
   def _jac(self, x):
-    ex = np.exp(x)
-    return ex * (1.0+x+ex) / (1.0+ex)**2
+    fx = _numpy_sigmoid(x)
+    return fx + x * fx * (1.0 - fx)
 
   def _fun_torch(self, x):
-    return x * torch.sigmoid(x)
+    return functional.silu(x)
 
   def _jac_torch(self, x):
     sig = torch.sigmoid(x)
     return sig + x * sig * (1.0 - sig)
 
+  def _fun_jac_torch(self, x):
+    sig = torch.sigmoid(x)
+    return x * sig, sig + x * sig * (1.0 - sig)
+
 # ReLU
 # -------------------------------------
 class ReLU(BaseAct):
 
-  def __init__(self):
-    self._fun = np.vectorize(self._fun)
-    self._jac = np.vectorize(self._jac)
-    super(ReLU, self).__init__()
-
   def _fun(self, x):
-    return x if (x > 0.0) else 0.0
+    return np.maximum(x, 0.0)
 
   def _jac(self, x):
-    return 1.0 if (x > 0.0) else 0.0
+    return np.where(np.asarray(x) > 0.0, 1.0, 0.0)
 
   def _fun_torch(self, x):
-    return torch.where(x > 0.0, x, torch.zeros_like(x))
+    return torch.relu(x)
 
   def _jac_torch(self, x):
-    return torch.where(x > 0.0, torch.ones_like(x), torch.zeros_like(x))
+    return torch.gt(x, 0.0).to(dtype=x.dtype)
+
+  def _fun_jac_torch(self, x):
+    return torch.relu(x), torch.gt(x, 0.0).to(dtype=x.dtype)
 
 # ELU
 # -------------------------------------
@@ -505,16 +594,36 @@ class ELU(ReLU):
     super(ELU, self).__init__()
 
   def _fun(self, x):
-    return x if (x > 0.0) else self.alpha*(np.exp(x)-1.0)
+    x = np.asarray(x)
+    return np.where(
+      x > 0.0,
+      x,
+      self.alpha * np.expm1(np.minimum(x, 0.0)),
+    )
 
   def _jac(self, x):
-    return 1.0 if (x > 0.0) else self.alpha*np.exp(x)
+    x = np.asarray(x)
+    return np.where(
+      x > 0.0,
+      1.0,
+      self.alpha * np.exp(np.minimum(x, 0.0)),
+    )
 
   def _fun_torch(self, x):
-    return torch.where(x > 0.0, x, self.alpha * (torch.exp(x) - 1.0))
+    return functional.elu(x, alpha=self.alpha)
 
   def _jac_torch(self, x):
-    return torch.where(x > 0.0, torch.ones_like(x), self.alpha * torch.exp(x))
+    result = functional.elu(x, alpha=self.alpha)
+    return torch.where(x > 0.0, torch.ones_like(x), result + self.alpha)
+
+  def _fun_jac_torch(self, x):
+    result = functional.elu(x, alpha=self.alpha)
+    derivative = torch.where(
+      x > 0.0,
+      torch.ones_like(x),
+      result + self.alpha,
+    )
+    return result, derivative
 
 # Mixed
 # -------------------------------------
@@ -529,8 +638,8 @@ class Mixed(BaseAct):
     # activation call.
     self._torch_masks = {}
     self._torch_parts_cache = {}
+    self._torch_packed_cache = {}
     coverage_indices = []
-    coverage_known = True
     for (act, mask) in masks.items():
       if torch.is_tensor(mask):
         if mask.dtype != torch.bool and mask.dtype not in (
@@ -554,9 +663,9 @@ class Mixed(BaseAct):
         else np.asarray(mask).reshape(-1)
       )
       self.masks[act] = (get(act), mask)
-      if torch.is_tensor(mask) and mask.device.type != "cpu":
-        coverage_known = False
-        continue
+      # Materialize coverage metadata once. Device-resident masks incur one
+      # preparation-time host transfer, allowing subsequent calls to use the
+      # packed execution plan without repeated coverage checks.
       mask_array = (
         mask.detach().cpu().numpy() if torch.is_tensor(mask)
         else np.asarray(mask)
@@ -566,16 +675,13 @@ class Mixed(BaseAct):
       coverage_indices.extend(
         np.asarray(mask_array, dtype=np.int64).tolist()
       )
-    if coverage_known:
-      unique_indices = np.unique(np.asarray(coverage_indices, dtype=np.int64))
-      self._coverage = (
-        len(coverage_indices),
-        len(unique_indices),
-        int(unique_indices[0]) if len(unique_indices) else None,
-        int(unique_indices[-1]) if len(unique_indices) else None,
-      )
-    else:
-      self._coverage = None
+    unique_indices = np.unique(np.asarray(coverage_indices, dtype=np.int64))
+    self._coverage = (
+      len(coverage_indices),
+      len(unique_indices),
+      int(unique_indices[0]) if len(unique_indices) else None,
+      int(unique_indices[-1]) if len(unique_indices) else None,
+    )
 
   def _torch_mask(self, act_id, mask, device):
     device_key = str(torch.device(device))
@@ -656,6 +762,37 @@ class Mixed(BaseAct):
       self._torch_parts_cache[cache_key] = parts
     return parts
 
+  def _torch_packed_plan(self, device, size, parts=None):
+    """Build one gather/scatter plan for a full, disjoint partition."""
+    device_key = str(torch.device(device))
+    cache_key = (device_key, int(size))
+    if cache_key in self._torch_packed_cache:
+      return self._torch_packed_cache[cache_key]
+
+    if not self._full_coverage(size):
+      self._torch_packed_cache[cache_key] = None
+      return None
+    if parts is None:
+      parts = self._torch_parts(device, size)
+    indices = tuple(indices for _, indices in parts)
+    if indices:
+      order = torch.cat(indices)
+    else:
+      order = torch.empty(0, dtype=torch.long, device=device)
+    packed_groups = []
+    start = 0
+    for act, indices in parts:
+      end = start + indices.numel()
+      packed_groups.append((act, start, end))
+      start = end
+    identity = torch.equal(
+      order,
+      torch.arange(int(size), dtype=torch.long, device=device),
+    )
+    plan = (order, tuple(packed_groups), identity)
+    self._torch_packed_cache[cache_key] = plan
+    return plan
+
   def _full_coverage(self, size):
     """Return whether the masks form a disjoint partition of ``range(size)``."""
     if self._coverage is None:
@@ -695,19 +832,28 @@ class Mixed(BaseAct):
     return tuple(signature)
 
   def _fun(self, x):
-    y = copy.deepcopy(x)
+    y = x.copy()
     for (act, mask) in self.masks.values():
       y[mask] = act._fun(x[mask])
     return y
 
   def _jac(self, x):
-    y = copy.deepcopy(x)
+    # Match the established Torch Mixed convention: only masked entries
+    # contribute to the returned derivative vector; uncovered entries remain
+    # zero even though the forward path preserves their values.
+    y = np.zeros_like(x)
     for (act, mask) in self.masks.values():
       y[mask] = act._jac(x[mask])
     return y
 
   def _fun_torch(self, x):
     parts = self._torch_parts(x.device, x.numel())
+    packed_plan = self._torch_packed_plan(x.device, x.numel(), parts)
+    if packed_plan is not None:
+      return _mixed_fun_from_parts(
+        x,
+        (parts, True, packed_plan),
+      )
     y = torch.empty_like(x) if self._full_coverage(x.numel()) else torch.clone(x)
     for act, indices in parts:
       values = act._fun_torch(x.index_select(0, indices))
@@ -716,6 +862,21 @@ class Mixed(BaseAct):
 
   def _jac_torch(self, x):
     parts = self._torch_parts(x.device, x.numel())
+    packed_plan = self._torch_packed_plan(x.device, x.numel(), parts)
+    if packed_plan is not None:
+      order, packed_groups, identity = packed_plan
+      if identity:
+        dy = torch.empty_like(x)
+        for act, start, end in packed_groups:
+          dy[start:end] = act._jac_torch(x[start:end])
+        return dy
+
+      grouped = x.index_select(0, order)
+      dy_grouped = torch.empty_like(grouped)
+      for act, start, end in packed_groups:
+        dy_grouped[start:end] = act._jac_torch(grouped[start:end])
+      dy = torch.empty_like(x)
+      return dy.index_copy_(0, order, dy_grouped)
     y = torch.empty_like(x) if self._full_coverage(x.numel()) else torch.zeros_like(x)
     for act, indices in parts:
       values = act._jac_torch(x.index_select(0, indices))
@@ -723,15 +884,22 @@ class Mixed(BaseAct):
     return y
 
   def _fun_jac_torch(self, x):
-    """Evaluate Mixed forward and derivative with one gather per mask."""
+    """Evaluate Mixed forward and derivative with packed full partitions."""
     parts = self._torch_parts(x.device, x.numel())
+    packed_plan = self._torch_packed_plan(x.device, x.numel(), parts)
+    if packed_plan is not None:
+      return _mixed_fun_jac_from_parts(
+        x,
+        (parts, True, packed_plan),
+      )
     full_coverage = self._full_coverage(x.numel())
     y = torch.empty_like(x) if full_coverage else torch.clone(x)
     dy = torch.empty_like(x) if full_coverage else torch.zeros_like(x)
     for act, indices in parts:
       values = x.index_select(0, indices)
-      y.index_copy_(0, indices, act._fun_torch(values))
-      dy.index_copy_(0, indices, act._jac_torch(values))
+      result, derivative = act._fun_jac_torch(values)
+      y.index_copy_(0, indices, result)
+      dy.index_copy_(0, indices, derivative)
     return y, dy
 
 # Softplus
@@ -757,3 +925,7 @@ class Softplus(BaseAct):
 
   def _jac_torch(self, x):
     return torch.sigmoid(x)
+
+  def _fun_jac_torch(self, x):
+    result = functional.softplus(x)
+    return result, torch.sigmoid(x)

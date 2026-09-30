@@ -184,9 +184,9 @@ def _validate_rank_counts(spec: dict[str, Any], ranks: list[int]) -> None:
 
 
 def _configure_backend(name: str, threads: int, seed: int | None) -> Any:
-    from dd_nm_rom import backend as bkd
-
     if name == "numpy":
+        from dd_nm_rom import backend as bkd
+
         bkd.set_backend("numpy")
         bkd.set_device("cpu", nb_threads=threads)
         bkd.set_floatx("float64")
@@ -198,6 +198,15 @@ def _configure_backend(name: str, threads: int, seed: int | None) -> Any:
 
             if not torch.cuda.is_available():
                 raise RuntimeError("torch_gpu benchmark requested, but CUDA is unavailable")
+            # Initialize HIP before importing dd_nm_rom.backend.  That module
+            # imports mpi4py at module scope; with Cray MPICH GPU support
+            # enabled, mpi4py can initialize MPICH/GTL before PyTorch has
+            # initialized the HIP runtime, after which PyTorch may report no
+            # visible devices.
+            torch.cuda.init()
+
+        from dd_nm_rom import backend as bkd
+
         bkd.set(
             backend="torch",
             device=device,

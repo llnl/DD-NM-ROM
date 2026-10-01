@@ -4,7 +4,9 @@
 The target in a JSON spec is either a module-level callable accepting a config
 dictionary, or a module containing ``prepare(config)`` and ``run(state)``.
 Project workloads should keep model construction in ``prepare`` and one
-measured operation in ``run``.
+measured operation in ``run``.  Stateful workloads may also provide
+``reset(state, config)``; its return value is used as a fresh state before
+each warmup and measured repetition.
 
 Examples:
   .venv/bin/python benchmarks/benchmark.py --spec benchmarks/specs/backend_dense_linear.json
@@ -22,6 +24,7 @@ import os
 import platform
 import shlex
 import socket
+from statistics import median, pstdev
 import subprocess
 import sys
 import time
@@ -152,7 +155,13 @@ def _load_spec(path: Path) -> dict[str, Any]:
     return spec
 
 
-def _load_target(target: str) -> tuple[Callable[..., Any], Callable[..., Any] | None]:
+def _load_target(
+    target: str,
+) -> tuple[
+    Callable[..., Any],
+    tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any] | None]
+    | None,
+]:
     if ":" not in target:
         raise ValueError("target must have the form 'module:function'")
     module_name, function_name = target.split(":", 1)
@@ -160,10 +169,40 @@ def _load_target(target: str) -> tuple[Callable[..., Any], Callable[..., Any] | 
     target_fn = getattr(module, function_name)
     prepare = getattr(module, f"{function_name}_prepare", None)
     run = getattr(module, f"{function_name}_run", None)
+    reset = getattr(module, f"{function_name}_reset", None)
     if prepare is None or run is None:
         prepare = getattr(module, "prepare", None)
         run = getattr(module, "run", None)
-    return target_fn, (prepare, run) if prepare and run else None
+        reset = getattr(module, "reset", None)
+    return target_fn, (prepare, run, reset) if prepare and run else None
+
+
+def _reset_state(
+    reset: Callable[..., Any] | None,
+    state: Any,
+    config: dict[str, Any],
+) -> Any:
+    """Return the state for one independent benchmark invocation."""
+    if reset is None:
+        return state
+    fresh_state = reset(state, config)
+    # In-place reset hooks may return None; retaining this convention keeps
+    # the hook useful for small state objects while allowing DD workloads to
+    # return a newly prepared model.
+    return state if fresh_state is None else fresh_state
+
+
+def _timing_summary(values: list[float]) -> dict[str, float]:
+    """Summarize a nonempty collection of timing samples."""
+    return {
+        "min": min(values),
+        "max": max(values),
+        "mean": sum(values) / len(values),
+        "median": median(values),
+        # Repetitions are the complete observed sample for this benchmark
+        # invocation, so report population rather than sample deviation.
+        "stddev": pstdev(values),
+    }
 
 
 def _validate_rank_counts(spec: dict[str, Any], ranks: list[int]) -> None:
@@ -184,9 +223,9 @@ def _validate_rank_counts(spec: dict[str, Any], ranks: list[int]) -> None:
 
 
 def _configure_backend(name: str, threads: int, seed: int | None) -> Any:
-    from dd_nm_rom import backend as bkd
-
     if name == "numpy":
+        from dd_nm_rom import backend as bkd
+
         bkd.set_backend("numpy")
         bkd.set_device("cpu", nb_threads=threads)
         bkd.set_floatx("float64")
@@ -198,6 +237,15 @@ def _configure_backend(name: str, threads: int, seed: int | None) -> Any:
 
             if not torch.cuda.is_available():
                 raise RuntimeError("torch_gpu benchmark requested, but CUDA is unavailable")
+            # Initialize HIP before importing dd_nm_rom.backend.  That module
+            # imports mpi4py at module scope; with Cray MPICH GPU support
+            # enabled, mpi4py can initialize MPICH/GTL before PyTorch has
+            # initialized the HIP runtime, after which PyTorch may report no
+            # visible devices.
+            torch.cuda.init()
+
+        from dd_nm_rom import backend as bkd
+
         bkd.set(
             backend="torch",
             device=device,
@@ -234,12 +282,11 @@ def _run_worker(spec: dict[str, Any], backend: str, rank_count: int) -> dict[str
         rank = bkd.get_rank()
         target, protocol = _load_target(spec["target"])
         if protocol:
-            prepare, run = protocol
+            prepare, run, reset = protocol
             state = prepare(config)
-            invoke = lambda: run(state)
         else:
             state = None
-            invoke = lambda: target(config)
+            reset = None
 
         warmups = int(spec.get("warmups", 1))
         repetitions = int(spec.get("repetitions", 3))
@@ -247,21 +294,33 @@ def _run_worker(spec: dict[str, Any], backend: str, rank_count: int) -> dict[str
             raise ValueError("warmups must be nonnegative and repetitions must be positive")
 
         for _ in range(warmups):
-            invoke()
+            if protocol:
+                state = _reset_state(reset, state, config)
+                run(state)
+            else:
+                target(config)
         timings = []
-        last_metrics: Any = None
+        metrics_per_repetition = []
         for _ in range(repetitions):
+            if protocol:
+                state = _reset_state(reset, state, config)
             _synchronize(bkd, device)
             start = time.perf_counter()
-            last_metrics = invoke()
+            repetition_metrics = run(state) if protocol else target(config)
             _synchronize(bkd, device)
             timings.append(time.perf_counter() - start)
+            metrics_per_repetition.append(
+                repetition_metrics if isinstance(repetition_metrics, dict) else {}
+            )
 
         record = {
             "rank": rank,
             "ranks": bkd.get_nranks(),
             "timings_seconds": timings,
-            "metrics": last_metrics if isinstance(last_metrics, dict) else {},
+            # Preserve the historical final-repetition alias while retaining
+            # the complete measured metric sequence for stateful solves.
+            "metrics": metrics_per_repetition[-1],
+            "metrics_per_repetition": metrics_per_repetition,
             "configuration": configuration,
         }
         if bkd.get_nranks() > 1:
@@ -274,6 +333,8 @@ def _run_worker(spec: dict[str, Any], backend: str, rank_count: int) -> dict[str
         all_times = [value for item in records for value in item["timings_seconds"]]
         critical_path = [max(item["timings_seconds"][i] for item in records)
                          for i in range(repetitions)]
+        all_timing_summary = _timing_summary(all_times)
+        critical_path_summary = _timing_summary(critical_path)
         configurations = [item["configuration"] for item in records]
         configuration_consistent = all(
             item == configurations[0] for item in configurations[1:]
@@ -295,12 +356,15 @@ def _run_worker(spec: dict[str, Any], backend: str, rank_count: int) -> dict[str
             "configuration_consistent_across_ranks": configuration_consistent,
             "timings_seconds": critical_path,
             "summary": {
-                "min": min(all_times),
-                "max": max(all_times),
-                "mean": sum(all_times) / len(all_times),
-                "critical_path_mean": sum(critical_path) / len(critical_path),
+                **all_timing_summary,
+                "critical_path_mean": critical_path_summary["mean"],
+                "critical_path_median": critical_path_summary["median"],
+                "critical_path_stddev": critical_path_summary["stddev"],
             },
             "solver_metrics": records[0].get("metrics", {}),
+            "solver_metrics_per_repetition": records[0].get(
+                "metrics_per_repetition", []
+            ),
             "rank_records": records,
             **({} if configuration_consistent else {
                 "configuration_by_rank": configurations,

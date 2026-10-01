@@ -50,11 +50,37 @@ def _metrics(
         "converged": bool(converged),
         "newton_iterations": iterations,
         "residual_norm": residual_norm,
-        "internal_timing": runtime,
+        # The runtime dictionary belongs to the mutable model.  Snapshot it
+        # so a later reset cannot rewrite an earlier repetition's metrics.
+        "internal_timing": dict(runtime) if isinstance(runtime, dict) else runtime,
     }
     if activation_compile is not None:
         metrics["activation_compile"] = activation_compile
     return metrics
+
+
+def _restore_solve_state(model: Any) -> None:
+    """Restore fields mutated by the Newton/time-integration driver.
+
+    Rebuilding a distributed DD model for every repetition repeats model
+    loading, activation compilation, and MPI collectives.  Those operations
+    are setup, not solver state, and repeated construction can make a
+    multi-rank benchmark appear to hang.  The DD models keep the mutable
+    solve state in a small set of fields, so restore those fields in place.
+    """
+    runtime = getattr(model, "runtime", None)
+    if isinstance(runtime, dict):
+        for key in runtime:
+            runtime[key] = 0.0
+    for name, value in (
+        ("steady", True),
+        ("x_old", None),
+        ("dt", 0.0),
+        ("local_res_shapes", None),
+        ("resjac_it", 0),
+    ):
+        if hasattr(model, name):
+            setattr(model, name, value)
 
 
 def dd_fom_steady_prepare(config: dict[str, Any]) -> dict[str, Any]:
@@ -107,11 +133,26 @@ def dd_fom_steady_run(state: dict[str, Any]) -> dict[str, Any]:
     return _metrics(converged, residuals, dd_fom.runtime)
 
 
+def dd_fom_steady_reset(
+    state: dict[str, Any], config: dict[str, Any]
+) -> dict[str, Any]:
+    """Restore an independent steady DD-FOM solve state.
+
+    A DD solve mutates only its solver-related state; restoring it avoids
+    repeating distributed model construction between repetitions.
+    """
+    del config
+    _restore_solve_state(state["dd_fom"])
+    return state
+
+
 def dd_fom_steady(config: dict[str, Any]) -> dict[str, Any]:
     return dd_fom_steady_run(dd_fom_steady_prepare(config))
 
 
-def dd_fom_unsteady_prepare(config: dict[str, Any]) -> dict[str, Any]:
+def dd_fom_unsteady_prepare(
+    config: dict[str, Any], mu: np.ndarray | None = None
+) -> dict[str, Any]:
     from dd_nm_rom import backend as bkd
     from dd_nm_rom import field as field_mod
     from dd_nm_rom import fom as fom_mod
@@ -135,7 +176,9 @@ def dd_fom_unsteady_prepare(config: dict[str, Any]) -> dict[str, Any]:
         mu_lim=config.get("mu_lim", [0.9, 1.1]),
         bc_type=config.get("bc_type", "periodic"),
     )
-    field.set_params(mu=field.sample_design_space())
+    if mu is None:
+        mu = field.sample_design_space()
+    field.set_params(mu=mu)
     fom = fom_mod.Burgers2D(nu=float(config["viscosity"]), mesh=mesh)
     fom.build(field)
     x0 = np.concatenate([field.u().reshape(-1), field.v().reshape(-1)])
@@ -146,7 +189,12 @@ def dd_fom_unsteady_prepare(config: dict[str, Any]) -> dict[str, Any]:
         subs_per_rank=total // bkd.get_nranks(),
     )
     dd_fom.build()
-    return {"dd_fom": dd_fom, "x0": dd_fom.get_init_sol(x=x0), "config": config}
+    return {
+        "dd_fom": dd_fom,
+        "x0": dd_fom.get_init_sol(x=x0),
+        "config": config,
+        "mu": np.array(mu, copy=True),
+    }
 
 
 def dd_fom_unsteady_run(state: dict[str, Any]) -> dict[str, Any]:
@@ -166,6 +214,15 @@ def dd_fom_unsteady_run(state: dict[str, Any]) -> dict[str, Any]:
     return _metrics(converged, residuals, dd_fom.runtime)
 
 
+def dd_fom_unsteady_reset(
+    state: dict[str, Any], config: dict[str, Any]
+) -> dict[str, Any]:
+    """Restore an independent unsteady DD-FOM solve state."""
+    del config
+    _restore_solve_state(state["dd_fom"])
+    return state
+
+
 def dd_fom_unsteady(config: dict[str, Any]) -> dict[str, Any]:
     return dd_fom_unsteady_run(dd_fom_unsteady_prepare(config))
 
@@ -180,7 +237,9 @@ def _network_paths(config: dict[str, Any]) -> dict[str, str]:
     return paths
 
 
-def dd_rom_prepare(config: dict[str, Any]) -> dict[str, Any]:
+def dd_rom_prepare(
+    config: dict[str, Any], mu: np.ndarray | None = None
+) -> dict[str, Any]:
     from dd_nm_rom import backend as bkd
     from dd_nm_rom import field as field_mod
     from dd_nm_rom import fom as fom_mod
@@ -205,7 +264,9 @@ def dd_rom_prepare(config: dict[str, Any]) -> dict[str, Any]:
         mu_lim=config.get("mu_lim", [0.5, 1.5]),
         bc_type=config.get("bc_type", "periodic"),
     )
-    field.set_params(mu=field.sample_design_space())
+    if mu is None:
+        mu = field.sample_design_space()
+    field.set_params(mu=mu)
     fom = fom_mod.Burgers2D(
         mesh=mesh,
         nu=float(config["viscosity"]),
@@ -237,7 +298,12 @@ def dd_rom_prepare(config: dict[str, Any]) -> dict[str, Any]:
         check_unique_models=bool(config.get("check_unique_models", True)),
     )
     x0 = np.concatenate([field.u().reshape(-1), field.v().reshape(-1)])
-    return {"dd_rom": dd_rom, "x0": x0, "config": config}
+    return {
+        "dd_rom": dd_rom,
+        "x0": x0,
+        "config": config,
+        "mu": np.array(mu, copy=True),
+    }
 
 
 def dd_rom_run(state: dict[str, Any]) -> dict[str, Any]:
@@ -247,8 +313,9 @@ def dd_rom_run(state: dict[str, Any]) -> dict[str, Any]:
     env_name = config.get("profile_maxit_env")
     if env_name and os.environ.get(env_name):
         maxit = int(os.environ[env_name])
+    x0 = dd_rom.get_init_sol(x=state["x0"])
     uv, z, lambdas, residuals, converged = dd_rom.solve(
-        x0=dd_rom.get_init_sol(x=state["x0"]),
+        x0=x0,
         runtime=0.0,
         use_guess=False,
         tol=float(config.get("tol", 1e-8)),
@@ -263,6 +330,22 @@ def dd_rom_run(state: dict[str, Any]) -> dict[str, Any]:
         dd_rom.runtime,
         activation_compile=dd_rom.activation_compile_stats,
     )
+
+
+def dd_rom_reset(
+    state: dict[str, Any], config: dict[str, Any]
+) -> dict[str, Any]:
+    """Restore an independent DD-ROM solve state.
+
+    ``DD_NM_ROM.solve`` mutates the ROM solver fields and its DD-FOM backing
+    model.  Restore both without rebuilding the distributed model, which
+    avoids repeating MPI setup and activation compilation.
+    """
+    del config
+    dd_rom = state["dd_rom"]
+    _restore_solve_state(dd_rom)
+    _restore_solve_state(dd_rom.dd_fom)
+    return state
 
 
 def dd_rom(config: dict[str, Any]) -> dict[str, Any]:

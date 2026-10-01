@@ -1297,6 +1297,9 @@ def gatherv_tensor(
   :return: Gathered data on root, or the local tensor on other ranks.
   :rtype: torch.Tensor or list[torch.Tensor]
   """
+  if not distributed():
+    return GathervRequest(result=x) if async_op else x
+
   if async_op:
     return igatherv_tensor(
       x=x,
@@ -1309,9 +1312,6 @@ def gatherv_tensor(
       cache_key=cache_key,
       validate_cache=validate_cache,
     )
-
-  if not distributed():
-    return x
 
   x_sparse = False
   if isinstance(x, List):

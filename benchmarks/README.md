@@ -11,6 +11,10 @@ SLURM/FLUX batch-script generation. Use the repository virtual environment:
 A workload is either a callable accepting a configuration dictionary, or a
 module exposing `prepare(config)` and `run(state)`. Keep construction and
 loading in `prepare`; `run` should perform exactly one operation to measure.
+Stateful workloads may additionally expose `reset(state, config)`. The runner
+calls this hook before every warmup and measured repetition, and excludes the
+reset time from the measurement. The reset hook should return a fresh state or
+reset the supplied state in place.
 
 For scheduler scripts, generation is side-effect free unless `--submit` is
 given:
@@ -129,8 +133,11 @@ rank.
 The included DD workloads are in `workloads_dd.py`. They provide
 `prepare/run` hooks for the three regression-derived specs and return
 `converged`, `newton_iterations`, `residual_norm`, and `internal_timing`
-metrics. These appear both in each rank record and in the top-level
-`solver_metrics` result field.
+metrics. Each rank record stores the metrics for every measured repetition in
+`metrics_per_repetition`; `metrics` and the top-level `solver_metrics` retain
+the final-repetition alias for compatibility. Timing summaries report
+`min`, `max`, `mean`, `median`, and population `stddev`, with corresponding
+`critical_path_*` fields for MPI runs.
 
 Use one spec per decomposition size. Change `n_sub_x` and `n_sub_y` in a
 copied spec, then provide only rank counts that divide the total number of
@@ -144,8 +151,10 @@ subdomains:
   --ranks 1,2,4,8,16,32,64
 ```
 
-Full DD-FOM/DD-ROM solves default to one measured repetition because solver
-state may be mutated by a solve.
+Full DD-FOM/DD-ROM workloads provide reset hooks that restore the mutable
+solver state before each invocation, so they may use multiple measured
+repetitions without accumulating solver state or repeating distributed model
+setup. Reset time remains outside the measured solve interval.
 
 Backend microbenchmarks
 -----------------------

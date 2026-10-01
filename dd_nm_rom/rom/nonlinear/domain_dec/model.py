@@ -19,6 +19,7 @@ from dd_nm_rom.utils import parallel_print
 from .rbf_model import RBFModel
 from .subdomain import SubdomainROM
 from ..autoencoder import AutoencoderNP, MultiAutoencoderNP
+from ..autoencoder.nn_numpy import activation as activation_mod
 
 logger = logging.getLogger(__name__)
 
@@ -150,11 +151,19 @@ class DD_NM_ROM(object):
     # Trigger torch.compile on each rank's local activation functions before
     # any rank can enter the solver's distributed collectives.  Compiled
     # callables are process-local, so every rank must warm its own models.
+    activation_mod.reset_compile_stats()
     compile_exception = None
     try:
-      self.compile_activations()
+      activations_compiled = self.compile_activations()
+      # Inductor compilation and the warmup launches may leave CUDA work
+      # asynchronous. Synchronize before the error allgather so an
+      # asynchronous device failure is reported consistently by every rank.
+      if activations_compiled and bkd.device() == "cuda":
+        torch.cuda.synchronize()
     except Exception as exc:
       compile_exception = exc
+
+    self.activation_compile_stats = activation_mod.get_compile_stats()
 
     if bkd.distributed():
       compile_errors = bkd._COMM.allgather(
@@ -215,13 +224,15 @@ class DD_NM_ROM(object):
 
   def compile_activations(self):
     compiled = set()
+    any_compiled = False
     for sub in self.subdomains:
       for state in sub.elem_states.values():
         model = state.nn_model
         if model is None or id(model) in compiled:
           continue
-        model.compile_activations()
+        any_compiled = model.compile_activations() or any_compiled
         compiled.add(id(model))
+    return any_compiled
   
   def get_res_bases(self, index=0):
     if (self.res_bases is not None):

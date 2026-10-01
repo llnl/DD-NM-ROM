@@ -106,6 +106,235 @@ def test_compiled_torch_activations(name, values, kwargs):
   np.testing.assert_allclose(jac_torch.cpu().numpy(), np.diag(jac_np.todense()))
 
 
+def test_numpy_activation_dispatch_survives_torch_activation_setup():
+  # ``activation.get`` installs the Torch dispatcher on BaseAct globally.
+  activation.get("softplus")
+  act = activation.ReLU()
+  values = np.array([-1.0, 0.0, 2.0])
+
+  actual, actual_jac = act(values, with_jac=True)
+
+  np.testing.assert_allclose(actual, np.maximum(values, 0.0))
+  np.testing.assert_allclose(
+    actual_jac.todense(),
+    np.diag([0.0, 0.0, 1.0]),
+  )
+
+
+def test_mixed_torch_activation_uses_device_indices():
+  values = np.array([-2.0, -0.5, 0.0, 0.25, 3.0, 1.5])
+  masks = {
+    "softplus": np.array([0, 2, 5]),
+    "relu": np.array([1, 3, 4]),
+  }
+  x_torch = _torch_activation_input(values)
+
+  expected = deepcopy(values)
+  expected[masks["softplus"]] = activation.Softplus()._fun(
+    values[masks["softplus"]]
+  )
+  expected[masks["relu"]] = activation.ReLU()._fun(values[masks["relu"]])
+  expected_jac = np.zeros_like(values)
+  expected_jac[masks["softplus"]] = activation.Softplus()._jac(
+    values[masks["softplus"]]
+  )
+  expected_jac[masks["relu"]] = activation.ReLU()._jac(values[masks["relu"]])
+  mixed_torch = activation.get("mixed", masks=masks)
+  actual, actual_jac = mixed_torch(x_torch, with_jac=True)
+
+  np.testing.assert_allclose(actual.cpu().numpy(), expected)
+  np.testing.assert_allclose(
+    actual_jac.cpu().numpy(),
+    expected_jac,
+  )
+  assert len(mixed_torch._torch_masks) == 1
+  assert set(mixed_torch._torch_masks[next(iter(mixed_torch._torch_masks))]) == \
+    {"softplus", "relu"}
+  assert mixed_torch._full_coverage(values.size) is True
+
+
+def test_mixed_torch_activation_preserves_partial_masks():
+  values = np.array([-2.0, -0.5, 0.0, 0.25])
+  masks = {
+    "softplus": np.array([0, 2]),
+    "relu": np.array([1]),
+  }
+  x_torch = _torch_activation_input(values)
+  mixed_torch = activation.get("mixed", masks=masks)
+
+  actual, actual_jac = mixed_torch(x_torch, with_jac=True)
+  expected = values.copy()
+  expected[[0, 2]] = activation.Softplus()._fun(values[[0, 2]])
+  expected[1] = activation.ReLU()._fun(values[1])
+  expected_jac = np.zeros_like(values)
+  expected_jac[[0, 2]] = activation.Softplus()._jac(values[[0, 2]])
+  expected_jac[1] = activation.ReLU()._jac(values[1])
+
+  np.testing.assert_allclose(actual.cpu().numpy(), expected)
+  np.testing.assert_allclose(actual_jac.cpu().numpy(), expected_jac)
+  assert mixed_torch._full_coverage(values.size) is False
+
+
+def test_mixed_torch_activation_supports_negative_indices():
+  values = np.array([-2.0, 0.25, 3.0, -0.5])
+  masks = {
+    "softplus": np.array([-1, 0]),
+    "relu": np.array([1]),
+  }
+  mixed_torch = activation.get("mixed", masks=masks)
+  actual, actual_jac = mixed_torch(
+    _torch_activation_input(values), with_jac=True
+  )
+
+  expected = values.copy()
+  expected[[-1, 0]] = activation.Softplus()._fun(values[[-1, 0]])
+  expected[1] = activation.ReLU()._fun(values[1])
+  expected_jac = np.zeros_like(values)
+  expected_jac[[-1, 0]] = activation.Softplus()._jac(values[[-1, 0]])
+  expected_jac[1] = activation.ReLU()._jac(values[1])
+
+  np.testing.assert_allclose(actual.cpu().numpy(), expected)
+  np.testing.assert_allclose(actual_jac.cpu().numpy(), expected_jac)
+
+
+def test_mixed_masks_reject_noninteger_and_out_of_bounds_indices():
+  with pytest.raises(TypeError, match="boolean or integer"):
+    activation.get("mixed", masks={"relu": np.array([0.5])})
+
+  mixed_torch = activation.get(
+    "mixed", masks={"relu": np.array([3])}
+  )
+  with pytest.raises(IndexError, match="out of bounds"):
+    mixed_torch(torch.zeros(3), with_jac=False)
+
+  boolean_mask = activation.get(
+    "mixed", masks={"relu": np.array([True, False])}
+  )
+  with pytest.raises(IndexError, match="boolean mask"):
+    boolean_mask(torch.zeros(3), with_jac=False)
+
+
+def test_mixed_jacobian_can_be_compiled(monkeypatch):
+  calls = []
+
+  monkeypatch.setattr(
+    torch,
+    "compile",
+    lambda fun, **kwargs: calls.append((fun, kwargs)) or fun,
+    raising=True,
+  )
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
+
+  masks = {
+    "softplus": np.array([0, 2, 5]),
+    "relu": np.array([1, 3, 4]),
+  }
+  act = activation.get("mixed", masks=masks)
+  assert activation.warmup(
+    act, 8192, "cpu", torch.float32, role="decoder"
+  ) is True
+
+  x = torch.randn(8192)
+  actual, actual_jac = act(x, with_jac=True)
+  expected = act._fun_torch(x)
+  expected_jac = act._jac_torch(x)
+  assert len(calls) == 1
+  assert torch.allclose(actual, expected)
+  assert torch.allclose(actual_jac, expected_jac)
+  assert activation.get_compile_stats()["skipped_mixed"] == 0
+
+
+def test_mixed_compile_cache_includes_mask_layout(monkeypatch):
+  calls = []
+
+  monkeypatch.setattr(
+    torch,
+    "compile",
+    lambda fun, **kwargs: calls.append((fun, kwargs)) or fun,
+    raising=True,
+  )
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
+
+  first = activation.get(
+    "mixed",
+    masks={"softplus": np.array([0, 1]), "relu": np.array([2, 3])},
+  )
+  second = activation.get(
+    "mixed",
+    masks={"softplus": np.array([0, 2]), "relu": np.array([1, 3])},
+  )
+  assert activation.warmup(first, 8192, "cpu", torch.float32, role="decoder")
+  assert activation.warmup(second, 8192, "cpu", torch.float32, role="decoder")
+  assert len(calls) == 2
+
+
+def test_activation_allowlist_can_select_mixed(monkeypatch):
+  calls = []
+
+  monkeypatch.setattr(
+    torch,
+    "compile",
+    lambda fun, **kwargs: calls.append((fun, kwargs)) or fun,
+    raising=True,
+  )
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE_ACTIVATIONS", "mixed")
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
+
+  softplus = activation.get("softplus")
+  mixed = activation.get("mixed", masks={})
+  assert activation.warmup(
+    softplus, 8192, "cpu", torch.float32, role="decoder"
+  ) is False
+  assert activation.warmup(
+    mixed, 8192, "cpu", torch.float32, role="decoder"
+  ) is True
+
+  assert len(calls) == 1
+  stats = activation.get_compile_stats()
+  assert stats["skipped_allowlist"] == 1
+  assert stats["compiled_functions"] == 1
+
+
+def test_mixed_top_k_policy_uses_frequency_and_mixed_cache_limit(monkeypatch):
+  calls = []
+
+  monkeypatch.setattr(
+    torch,
+    "compile",
+    lambda fun, **kwargs: calls.append((fun, kwargs)) or fun,
+    raising=True,
+  )
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE_ACTIVATIONS", "mixed")
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE_MIXED_POLICY", "top_k")
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE_MIXED_MIN_FREQUENCY", "2")
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE_MIXED_CACHE_MAXSIZE", "1")
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
+
+  first = activation.get("mixed", masks={"softplus": np.array([0, 1])})
+  second = activation.get("mixed", masks={"softplus": np.array([0, 1])})
+  other = activation.get("mixed", masks={"softplus": np.array([1, 2])})
+  other_repeat = activation.get("mixed", masks={"softplus": np.array([1, 2])})
+  assert activation.warmup(first, 8192, "cpu", torch.float32, role="decoder") is False
+  assert activation.warmup(second, 8192, "cpu", torch.float32, role="decoder") is True
+  assert activation.warmup(other, 8192, "cpu", torch.float32, role="decoder") is False
+  assert activation.warmup(
+    other_repeat, 8192, "cpu", torch.float32, role="decoder"
+  ) is False
+
+  assert len(calls) == 1
+  stats = activation.get_compile_stats()
+  assert stats["skipped_mixed_frequency"] == 2
+  assert stats["skipped_cache_full"] == 1
+
+
 def test_activation_compile_flag_controls_torch_compile(monkeypatch):
   calls = []
 
@@ -114,14 +343,173 @@ def test_activation_compile_flag_controls_torch_compile(monkeypatch):
     return fun
 
   monkeypatch.setattr(torch, "compile", fake_compile, raising=True)
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
   monkeypatch.setenv("DDNMROM_ACT_COMPILE", "0")
   activation.get("softplus")
   assert calls == []
 
   monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
-  activation.get("softplus")
+  act = activation.get("softplus")
+  activation.warmup(act, 4096, "cpu", torch.float32, role="decoder")
   assert len(calls) == 1
-  assert calls[0][1] == {"backend": "inductor", "dynamic": True}
+  assert all(
+    call[1] == {"backend": "inductor", "dynamic": False}
+    for call in calls
+  )
+
+
+def test_compiled_activations_are_cached_by_shape(monkeypatch):
+  calls = []
+
+  def fake_compile(fun, **kwargs):
+    calls.append((fun, kwargs))
+    return fun
+
+  monkeypatch.setattr(torch, "compile", fake_compile, raising=True)
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
+  activation.warmup(activation.get("softplus"), 4096, "cpu", torch.float32, role="decoder")
+  activation.warmup(activation.get("softplus"), 4096, "cpu", torch.float32, role="decoder")
+  activation.warmup(activation.get("softplus"), 8192, "cpu", torch.float32, role="decoder")
+  assert len(calls) == 2
+
+
+def test_static_compilation_falls_back_when_cache_is_full(monkeypatch):
+  calls = []
+
+  def fake_compile(fun, **kwargs):
+    calls.append((fun, kwargs))
+    return fun
+
+  monkeypatch.setattr(torch, "compile", fake_compile, raising=True)
+  monkeypatch.setattr(activation, "_COMPILED_CACHE_MAXSIZE", 1)
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
+
+  act = activation.get("softplus")
+  first = activation.warmup(act, 4096, "cpu", torch.float32, role="decoder")
+  second = activation.warmup(
+    act, 8192, "cpu", torch.float32, role="decoder"
+  )
+
+  assert first is True
+  assert second is False
+  assert len(calls) == 1
+  assert act._compiled_fun_jac is None
+  stats = activation.get_compile_stats()
+  assert stats["skipped_cache_full"] == 1
+
+
+def test_compile_stats_report_eligibility_and_cache_use(monkeypatch):
+  def fake_compile(fun, **kwargs):
+    return fun
+
+  monkeypatch.setattr(torch, "compile", fake_compile, raising=True)
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE_ENCODER", "1")
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
+
+  activation.warmup(
+    activation.get("softplus"),
+    4096,
+    "cpu",
+    torch.float32,
+    role="decoder",
+  )
+  activation.warmup(
+    activation.get("softplus"),
+    4096,
+    "cpu",
+    torch.float32,
+    role="decoder",
+  )
+  activation.warmup(
+    activation.get("softplus"),
+    1024,
+    "cpu",
+    torch.float32,
+    role="encoder",
+  )
+
+  stats = activation.get_compile_stats()
+  assert stats["warmup_calls"] == 3
+  assert stats["eligible_calls"] == 2
+  assert stats["cache_misses"] == 1
+  assert stats["cache_hits"] == 1
+  assert stats["skipped_small"] == 1
+  assert stats["compiled_functions"] == 1
+  assert stats["by_role_activation"]["decoder:Softplus"]["size_max"] == 4096
+  assert stats["by_role_activation"]["encoder:Softplus"]["size_max"] == 1024
+
+
+def test_compile_options_select_decoder_jacobian(monkeypatch):
+  calls = []
+
+  monkeypatch.setattr(
+    torch,
+    "compile",
+    lambda fun, **kwargs: calls.append((fun, kwargs)) or fun,
+    raising=True,
+  )
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
+
+  encoder = activation.get("softplus")
+  decoder = activation.get("softplus")
+  assert activation.warmup(encoder, 8464, "cpu", torch.float32, role="encoder") is False
+  assert activation.warmup(decoder, 21179, "cpu", torch.float32, role="decoder") is True
+
+  assert len(calls) == 1
+  assert encoder._compiled_fun_jac is None
+  assert decoder._compiled_fun_jac is not None
+  stats = activation.get_compile_stats()
+  assert stats["skipped_role"] == 1
+  assert stats["compiled_functions"] == 1
+
+
+def test_compile_forward_and_jacobian_options(monkeypatch):
+  calls = []
+
+  monkeypatch.setattr(
+    torch,
+    "compile",
+    lambda fun, **kwargs: calls.append((fun, kwargs)) or fun,
+    raising=True,
+  )
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE_FORWARD", "1")
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE_JAC", "0")
+  activation._COMPILED_CACHE.clear()
+  activation.reset_compile_stats()
+
+  act = activation.get("softplus")
+  assert activation.warmup(act, 4096, "cpu", torch.float32, role="decoder") is True
+  assert len(calls) == 1
+  assert act._compiled_fun_jac is None
+  assert act.fun is not act._fun_torch
+
+
+def test_small_and_trivial_activations_stay_eager(monkeypatch):
+  calls = []
+
+  monkeypatch.setattr(
+    torch,
+    "compile",
+    lambda fun, **kwargs: calls.append((fun, kwargs)) or fun,
+    raising=True,
+  )
+  monkeypatch.setenv("DDNMROM_ACT_COMPILE", "1")
+  activation._COMPILED_CACHE.clear()
+
+  assert activation.warmup(activation.get("softplus"), 4095, "cpu", torch.float32) is False
+  assert activation.warmup(activation.get("linear"), 8192, "cpu", torch.float32) is False
+  assert activation.warmup(activation.get("mixed", masks={}), 8192, "cpu", torch.float32) is True
+  assert len(calls) == 1
 
 
 def test_cpu_uses_eager_activations_by_default(monkeypatch):
